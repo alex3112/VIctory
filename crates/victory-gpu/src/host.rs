@@ -1817,8 +1817,9 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.flush();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    batch.range_written(dst, len);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -1881,6 +1882,43 @@ impl HostList {
     }
 }
 
+#[derive(Default)]
+struct RefreshRanges(Vec<(usize, usize)>);
+
+impl RefreshRanges {
+    fn intersects(&self, from: usize, to: usize) -> bool {
+        let i = self.0.partition_point(|&(_, end)| end <= from);
+        self.0.get(i).is_some_and(|&(start, _)| start < to)
+    }
+    fn contains(&self, from: usize, to: usize) -> bool {
+        let i = self.0.partition_point(|&(_, end)| end < to);
+        self.0.get(i).is_some_and(|&(start, _)| start <= from)
+    }
+
+    /// Only the holes need checking again before the next title write.
+    fn missing(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let mut holes = Vec::new();
+        let mut at = from;
+        for &(start, end) in &self.0 {
+            if start >= to { break; }
+            if end <= at { continue; }
+            if at < start { holes.push((at, start)); }
+            at = at.max(end);
+        }
+        if at < to { holes.push((at, to)); }
+        holes
+    }
+
+    fn include(&mut self, from: usize, to: usize) {
+        if from >= to { return; }
+        let first = self.0.partition_point(|&(_, end)| end < from);
+        let last = first + self.0[first..].iter().take_while(|&&(start, _)| start <= to).count();
+        let start = self.0.get(first).filter(|_| first < last).map_or(from, |r| from.min(r.0));
+        let end = self.0.get(last.wrapping_sub(1)).filter(|_| first < last).map_or(to, |r| to.max(r.1));
+        self.0.splice(first..last, [(start, end)]);
+    }
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -1902,7 +1940,7 @@ struct Batch {
     pending: std::collections::HashMap<usize, usize>,
     /// The range of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, RefreshRanges)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
@@ -1910,7 +1948,12 @@ struct Batch {
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        if len == 0 || self.current.get(&key).is_some_and(|(_, ranges)| ranges.contains(address, end)) {
+            #[cfg(feature = "diagnostics")]
+            if len != 0 {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
+            }
             return;
         }
         match self.pending.get(&key) {
@@ -1939,6 +1982,25 @@ impl Batch {
         self.current.clear();
     }
 
+    /// A copy's destination is known: unrelated buffers stay current.
+    /// Unknown work still uses `title_written`, invalidating everything.
+    fn range_written(&mut self, address: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let affected = crate::watch::written_ranges(address, len);
+        self.textures.clear();
+        self.current.retain(|_, (_, ranges)| {
+            let keep = !affected.iter().any(|&(a, b)| ranges.intersects(a, b));
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                if keep { crate::copystat::C::RefreshKept } else { crate::copystat::C::RefreshInvalidated },
+                1,
+            );
+            keep
+        });
+    }
+
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
         #[cfg(feature = "diagnostics")]
@@ -1946,23 +2008,31 @@ impl Batch {
         self.pending.clear();
         let mut total = 0;
         for (shadow, from, to) in self.refreshes.drain(..) {
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            let (_, ranges) = self.current.entry(key).or_insert_with(|| (shadow.clone(), RefreshRanges::default()));
             let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
+            let mut copied = 0;
+            let missing = ranges.missing(from, to);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
+            {
+                let avoided = to - from - missing.iter().map(|&(a, b)| b - a).sum::<usize>();
+                if avoided != 0 {
+                    crate::copystat::add(crate::copystat::C::Skipped, 1);
+                    crate::copystat::add(crate::copystat::C::SkippedBytes, avoided as u64);
+                }
+            }
+            for (a, b) in missing {
+                #[cfg(feature = "diagnostics")]
+                let checking = std::time::Instant::now();
+                copied += shadow.update(a, b - a);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(a, b - a, checking.elapsed().as_micros() as u64, 0);
+            }
+            let us = started.elapsed().as_micros() as u64;
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
             total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
-            }
+            ranges.include(from, to);
         }
         total
     }
@@ -2910,6 +2980,89 @@ fn pump() {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    #[test]
+    fn known_copy_keeps_unrelated_buffers_but_invalidates_aliases() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(3);
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        crate::shadow::register(p + PAGE, (p + PAGE) as u64, PAGE as u64);
+        let a = crate::shadow::find(p as u64, PAGE as u64);
+        let b = crate::shadow::find((p + PAGE) as u64, PAGE as u64);
+        if let (Some(a), Some(b)) = (a, b) {
+            let mut batch = Batch::default();
+            batch.add(&a, p, PAGE);
+            batch.add(&b, p + PAGE, PAGE);
+            assert_eq!(batch.flush(), 2 * PAGE);
+            // SAFETY: two bytes in the test allocation.
+            unsafe {
+                (p as *mut u8).write_volatile(7);
+                ((p + PAGE) as *mut u8).write_volatile(9);
+            }
+            batch.range_written(p + 2 * PAGE, 1);
+            batch.add(&a, p, PAGE);
+            batch.add(&b, p + PAGE, PAGE);
+            assert_eq!(batch.flush(), 0, "an unrelated copy preserves both coverages");
+            crate::watch::title_memory_aliased(p + 2 * PAGE, &[p]);
+            batch.range_written(p + 2 * PAGE, 1);
+            batch.add(&a, p, PAGE);
+            batch.add(&b, p + PAGE, PAGE);
+            assert_eq!(batch.flush(), PAGE, "only the aliased buffer is refreshed");
+            assert_eq!(a.read_host(p as u64, 1)[0], 7);
+            assert_eq!(b.read_host((p + PAGE) as u64, 1)[0], 0);
+            batch.range_written(p + PAGE, 1);
+            batch.add(&b, p + PAGE, PAGE);
+            assert_eq!(batch.flush(), PAGE, "a direct write also invalidates coverage");
+            assert_eq!(b.read_host((p + PAGE) as u64, 1)[0], 9);
+            batch.title_written();
+            assert!(batch.current.is_empty(), "unknown work still invalidates everything");
+        }
+        crate::shadow::unregister(p, p as u64);
+        crate::shadow::unregister(p + PAGE, (p + PAGE) as u64);
+        crate::watch::tests::free(p);
+    }
+
+    #[test]
+    fn refresh_ranges_keep_disjoint_coverage_and_only_check_holes() {
+        let mut ranges = super::RefreshRanges::default();
+        ranges.include(10, 20);
+        ranges.include(40, 50);
+        assert!(ranges.contains(12, 18));
+        assert!(ranges.contains(40, 50));
+        assert!(!ranges.contains(15, 45));
+        assert_eq!(ranges.missing(0, 60), [(0, 10), (20, 40), (50, 60)]);
+        ranges.include(20, 40);
+        assert_eq!(ranges.0, [(10, 50)]);
+        ranges.include(0, 60);
+        assert!(ranges.missing(10, 50).is_empty());
+        assert!(ranges.missing(20, 20).is_empty());
+    }
+
+    #[test]
+    fn extending_refreshes_preserves_current_bytes_until_title_write() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(3);
+        let len = 3 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        if let Some(copy) = crate::shadow::find(p as u64, len as u64) {
+            let mut batch = Batch::default();
+            batch.add(&copy, p, PAGE);
+            assert_eq!(batch.flush(), PAGE);
+            batch.add(&copy, p + 2 * PAGE, PAGE);
+            assert_eq!(batch.flush(), PAGE);
+            // SAFETY: a byte of the test allocation, now tracked.
+            unsafe { (p as *mut u8).write_volatile(7) };
+            batch.add(&copy, p, len);
+            assert_eq!(batch.flush(), PAGE, "only the hole, not the already current page");
+            assert_eq!(copy.read_host(p as u64, 1)[0], 0);
+            batch.title_written();
+            batch.add(&copy, p, len);
+            assert_eq!(batch.flush(), PAGE, "an explicit title write invalidates coverage");
+            assert_eq!(copy.read_host(p as u64, 1)[0], 7);
+        }
+        crate::shadow::unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {

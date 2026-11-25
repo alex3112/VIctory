@@ -540,6 +540,23 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// Address ranges affected by a known write, including the runtime's
+/// physical-page aliases. Page granularity deliberately over-invalidates.
+pub(crate) fn written_ranges(at: usize, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let g = guards();
+    let mut ranges = vec![(first * PAGE, last.saturating_mul(PAGE))];
+    for others in g.alias_of.range(first..last).map(|(_, others)| others) {
+        ranges.extend(others.iter().map(|&page| (page * PAGE, (page + 1) * PAGE)));
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
