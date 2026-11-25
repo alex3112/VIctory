@@ -244,6 +244,24 @@ pub(crate) fn video_memory() -> Option<[(u64, u64); 2]> {
     ])
 }
 
+pub(crate) fn adapter_name() -> String {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let query = || -> Option<String> {
+            let h = HOST.get()?.as_ref()?;
+            // SAFETY: read-only DXGI queries for the live device's adapter.
+            let desc = unsafe {
+                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(h.device.GetAdapterLuid()).ok()?;
+                adapter.GetDesc1().ok()?
+            };
+            let n = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            Some(String::from_utf16_lossy(&desc.Description[..n]))
+        };
+        query().unwrap_or_else(|| "adapter unavailable".into())
+    }).clone()
+}
+
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
@@ -3423,6 +3441,8 @@ struct Presenter {
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
+    history: crate::overlay::History,
+    last_frame: Option<std::time::Instant>,
     since: std::time::Instant,
     frames: u32,
     drawn: u64,
@@ -3435,6 +3455,8 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
+            history: crate::overlay::History::default(),
+            last_frame: None,
             since: now,
             frames: 0,
             drawn: crate::draw::drawn(),
@@ -3445,6 +3467,10 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        let now = std::time::Instant::now();
+        if let Some(previous) = self.last_frame.replace(now) {
+            self.history.push((now - previous).as_secs_f64() * 1000.0);
+        }
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
@@ -3475,6 +3501,20 @@ impl Meter {
             [0, 1].map(|i| BINDLESS_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        let (made, loaded) = crate::pipeline::pipeline_counts();
+        let (hits, translated) = crate::shader_cache::counts();
+        #[cfg(feature = "diagnostics")]
+        let copy_details = crate::copystat::hud(frames);
+        #[cfg(not(feature = "diagnostics"))]
+        let copy_details = "Detailed copy counters: diagnostics build only";
+        crate::overlay::publish(hwnd.0 as usize, format!(
+            "{fps:.2} FPS | {ms:.2} ms/frame | {draws:.0} draws+dispatches/frame\nAdapter: {}\nCPU submit prep {cpu:.2} ms | GPU submit+wait {gpu:.2} ms\nCopy/refresh {copy_ms:.2} ms / {copy_mb:.2} MB per frame\nTexture uploads {texture_ms:.2} ms / {texture_mb:.2} MB per frame\nCopy-back {back_ms:.2} ms / {back_mb:.2} MB per frame\nBindless plans {plans_ms:.2} ms | records {records_ms:.2} ms\nDropped pipeline {dropped:.0}/frame | indirect {indirect:.0}/frame\nPipelines pending {} | made {made} | loaded {loaded} (session)\nShaders cache hits {hits} | translated {translated} (session)\nBindless backlog {} / {}\nDEBUG {} | GBV {} | WARP {} | detailed timing {}\n{copy_details}",
+            adapter_name(), crate::pipeline::making(),
+            crate::descriptor::host::BACKLOG[0].load(Ordering::Relaxed),
+            crate::descriptor::host::BACKLOG[1].load(Ordering::Relaxed),
+            crate::switch::on("VICTORY_D3D12_DEBUG"), crate::switch::on("VICTORY_D3D12_GBV"),
+            crate::switch::on("VICTORY_D3D12_WARP"), crate::switch::on("VICTORY_GPU_TIMING"),
+        ), &self.history);
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();

@@ -63,6 +63,8 @@ mod shadow;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
+mod overlay;
+#[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
 mod compose;

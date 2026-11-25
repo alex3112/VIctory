@@ -44,6 +44,28 @@ pub(crate) enum C {
 }
 const COUNTERS: usize = 26;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+static LOG_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Read the existing counters without draining the log or adding hot-path
+/// counters. The HUD runs immediately before the periodic log on one thread.
+pub(crate) fn hud(frames: f64) -> String {
+    static PREVIOUS: Mutex<([u64; COUNTERS], u64)> = Mutex::new(([0; COUNTERS], 0));
+    let epoch = LOG_EPOCH.load(Relaxed);
+    let now: [u64; COUNTERS] = std::array::from_fn(|i| COUNT[i].load(Relaxed));
+    let mut previous = PREVIOUS.lock().unwrap_or_else(|e| e.into_inner());
+    let delta = |c: C| {
+        let i = c as usize;
+        now[i].saturating_sub(if previous.1 == epoch { previous.0[i] } else { 0 }) as f64 / frames
+    };
+    let text = format!(
+        "Submissions {:.1}/frame | refresh requests {:.0}/frame\nAvoided checks {:.0}/frame / {:.1} MB | guards {:.0} faults/frame\nSnapshots {:.1} MB / {:.2} ms per frame\nKnown-copy coverage kept {:.0} / invalidated {:.0} per frame",
+        delta(C::Submissions), delta(C::Refreshes), delta(C::Skipped), delta(C::SkippedBytes) / 1e6,
+        delta(C::GuardFaults), delta(C::SnapshotBytes) / 1e6, delta(C::SnapshotUs) / 1e3,
+        delta(C::RefreshKept), delta(C::RefreshInvalidated),
+    );
+    *previous = (now, epoch);
+    text
+}
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
@@ -92,6 +114,7 @@ fn page_faults() -> u64 {
 /// Logs the counters per frame over `frames` frames, and the ranges that
 /// took most bytes.
 pub(crate) fn log(frames: f64) {
+    LOG_EPOCH.fetch_add(1, Relaxed);
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
