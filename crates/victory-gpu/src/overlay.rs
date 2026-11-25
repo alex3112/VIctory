@@ -49,11 +49,21 @@ pub(crate) fn publish(target: usize, text: String, history: &History) {
         let _ = std::thread::Builder::new().name("victory-overlay".into()).spawn(run);
         Mutex::new(State { target, text: String::new(), history: Vec::new(), updated: Instant::now(), paint: String::new() })
     });
-    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    update(state, target, text, history);
+}
+
+fn update(state: &Mutex<State>, target: usize, text: String, history: &History) -> bool {
+    // A HUD must never delay presentation behind window painting or UI work.
+    let mut s = match state.try_lock() {
+        Ok(s) => s,
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+    };
     s.target = target;
     s.text = format!("{text}\n{}", history.summary());
     s.history = history.0.iter().copied().collect();
     s.updated = Instant::now();
+    true
 }
 
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain([0]).collect() }
@@ -73,8 +83,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             SetBkMode(dc, TRANSPARENT as i32);
             SetTextColor(dc, 0x00d8f0d8);
             if let Some(state) = STATE.get() {
-                let s = state.lock().unwrap_or_else(|e| e.into_inner());
-                let text = wide(&s.paint);
+                let (paint, history) = {
+                    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+                    (s.paint.clone(), s.history.clone())
+                };
+                let text = wide(&paint);
                 let mut area = RECT { left: 12, top: 10, right: rect.right - 10, bottom: rect.bottom - 48 };
                 let drawn = DrawTextW(dc, text.as_ptr(), (text.len()-1) as i32, &mut area, DT_LEFT | DT_NOPREFIX);
                 if drawn == 0 && text.len() > 1 {
@@ -82,12 +95,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     WARNED.call_once(|| tracing::warn!("statistics overlay text could not be painted"));
                 }
                 // Frame-time trend, independently scaled; no GPU queries.
-                if s.history.len() > 1 {
-                    let max = s.history.iter().copied().fold(33.34, f64::max);
+                if history.len() > 1 {
+                    let max = history.iter().copied().fold(33.34, f64::max);
                     let pen = CreatePen(PS_SOLID, 1, 0x00d0d040);
                     let old_pen = SelectObject(dc, pen as _);
-                    for (i, &ms) in s.history.iter().enumerate() {
-                        let x = 12 + i as i32 * (rect.right - 24) / (s.history.len()-1) as i32;
+                    for (i, &ms) in history.iter().enumerate() {
+                        let x = 12 + i as i32 * (rect.right - 24) / (history.len()-1) as i32;
                         let y = rect.bottom - 8 - (ms / max * 32.0) as i32;
                         if i == 0 { MoveToEx(dc, x, y, std::ptr::null_mut()); } else { LineTo(dc, x, y); }
                     }
@@ -164,6 +177,7 @@ fn run() {
         let mut vram_text = String::new();
         let mut redrawn = Instant::now() - Duration::from_secs(1);
         let mut owner = std::ptr::null_mut();
+        let mut placement = None;
         loop {
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
@@ -185,7 +199,9 @@ fn run() {
                 }
                 keys[i] = down;
             }
-            if !visible || !focused || IsIconic(target) != 0 { ShowWindow(hwnd, SW_HIDE); }
+            if !visible || !focused || IsIconic(target) != 0 {
+                if placement.take().is_some() { ShowWindow(hwnd, SW_HIDE); }
+            }
             else {
                 if redrawn.elapsed() < Duration::from_millis(200) {
                     std::thread::sleep(Duration::from_millis(50));
@@ -209,8 +225,11 @@ fn run() {
                 drop(s);
                 let mut rect = RECT::default(); GetClientRect(target, &mut rect);
                 let mut point = POINT { x: 12, y: 12 }; ClientToScreen(target, &mut point);
-                SetWindowPos(hwnd, HWND_TOPMOST, point.x, point.y, 720.min((rect.right - 24).max(240)),
-                    (lines * 18 + 70).min((rect.bottom - 24).max(120)), SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                let bounds = (point.x, point.y, 720.min((rect.right - 24).max(240)), (lines * 18 + 70).min((rect.bottom - 24).max(120)));
+                if placement != Some(bounds) {
+                    SetWindowPos(hwnd, HWND_TOPMOST, bounds.0, bounds.1, bounds.2, bounds.3, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    placement = Some(bounds);
+                }
                 InvalidateRect(hwnd, std::ptr::null(), 0);
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -224,6 +243,19 @@ fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn busy_ui_drops_a_snapshot_instead_of_blocking_the_game() {
+        let state = Mutex::new(State {
+            target: 1, text: "old".into(), history: Vec::new(),
+            updated: Instant::now(), paint: String::new(),
+        });
+        let guard = state.lock().unwrap();
+        assert!(!update(&state, 2, "new".into(), &History::default()));
+        assert_eq!(guard.text, "old");
+        drop(guard);
+        assert!(update(&state, 2, "new".into(), &History::default()));
+        assert!(state.lock().unwrap().text.starts_with("new"));
+    }
     #[test]
     fn history_is_bounded_and_rejects_invalid_samples() {
         let mut h = History::default();
