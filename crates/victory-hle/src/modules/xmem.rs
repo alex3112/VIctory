@@ -822,12 +822,13 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
+    // Keep the runtime's physical-page registry for its own writes, while
+    // notifying the GPU guard registry once per mapped view (same section
+    // identity and byte offset as the physical page keys).
+    victory_gpu::title_memory_view(base, len, Arc::as_ptr(&slice.section) as usize, (slice.index * PAGE) as u64);
     victory_gpu::title_memory_remapped(base, len);
     for k in 0..len / PAGE {
-        let shown = physical.shown.entry(slice.key(k)).or_default();
-        // Pages shown elsewhere already: guarded here too if they are there.
-        victory_gpu::title_memory_aliased(base + k * PAGE, shown);
-        shown.push(base + k * PAGE);
+        physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
     true
@@ -928,6 +929,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
+        victory_gpu::title_memory_view_gone(at, size);
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {

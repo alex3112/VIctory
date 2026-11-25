@@ -44,3 +44,29 @@ in a separate checkout of unmodified Belobug `4cbe9d7`:
 
 The rest of the workspace is validated with those two names excluded from
 the test invocation; the tests themselves remain enabled in the source.
+
+
+## 2026-11-25: synchronization to Belobug AMD 01aadd1
+
+Source: https://github.com/Belobug/VIctory-Belobug-AMD/compare/4cbe9d7...01aadd1
+(20 upstream commits, GPL-3.0-or-later; original authors and commit history
+are recorded at the source link). The source commit is not present as a Git
+object in this independent repository, so this is a consolidated integration,
+not a two-parent merge. Existing local history is retained.
+
+- Import integer render-target blend handling, ambient tint/depth shading,
+  descriptor free-slot search changes and timeline/queue async coordination.
+- Integrate all upstream changes to sparse snapshots, tile copy-back and
+  experimental sweep; retain local segmented snapshots for ordinary buffers.
+- Use the upstream view guard registry, including kernel-write pins and
+  robust per-view unprotection, from our physical mapping implementation.
+  The local physical-page registry remains for HLE writes and the local
+  private-range check remains for refresh-coverage retention.
+- Preserve local FidelityFX bridge, overlay, prebuild tools and audit hooks
+  while applying upstream submission lifecycle and deferred completion.
+- Async submission and experimental tile sweep retain upstream opt-in defaults.
+- Update README reference status from Belobug; those results are not local
+  benchmarks.
+
+Validation: source-level integration and Git diff review only; Windows
+compilation, tests and same-scene benchmark are still required.

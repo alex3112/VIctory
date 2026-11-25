@@ -166,12 +166,16 @@ static TILE_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// Tile snapshots kept at most (512 MiB).
 const TILE_POOL_MOST: usize = 8192;
 
-/// An empty buffer with room for a tile.
-fn pooled_tile() -> Vec<u8> {
-    let kept = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
-    let mut v = kept.unwrap_or_else(|| Vec::with_capacity(PAGE));
-    v.clear();
-    v
+/// `n` empty buffers with room for a tile, under one lock of the pool.
+fn pooled_tiles(n: usize) -> Vec<Vec<u8>> {
+    let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    (0..n)
+        .map(|_| {
+            let mut v = pool.pop().unwrap_or_else(|| Vec::with_capacity(PAGE));
+            v.clear();
+            v
+        })
+        .collect()
 }
 
 /// Returns tile snapshots to their pool.
@@ -740,13 +744,21 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize, lazy: bool) -> usize {
-        // Diagnostics (`VICTORY_ALWAYS_COPY=1`): no write watch and no
-        // guard, every copy taken again once a frame. Slow; it tells a
-        // picture fault that comes from a stale copy from one that does not.
-        static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let always = *ALWAYS.get_or_init(|| std::env::var_os("VICTORY_ALWAYS_COPY").is_some_and(|v| v == "1"));
-        let mode = if always { NOT_WATCHED } else { self.watched.load(Ordering::Relaxed) };
-        let lazy = lazy && !always;
+        // Diagnostics (`VICTORY_ALWAYS_COPY`): 1 no write watch and no
+        // guard, every copy taken again once a frame, every tile looked at
+        // (slow); 2 only every tile looked at (no waiting 2 to 16 frames for
+        // one that had not changed); 3 only guarded memory taken again each
+        // frame (a guard does not see a write through another view of the
+        // page). They tell which of these leaves a copy stale.
+        static ALWAYS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let always = *ALWAYS
+            .get_or_init(|| std::env::var("VICTORY_ALWAYS_COPY").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        let mut mode = self.watched.load(Ordering::Relaxed);
+        let forced = always == 1 || always == 3 && mode == WATCHED_GUARDED;
+        if forced {
+            mode = NOT_WATCHED;
+        }
+        let lazy = lazy && !forced && always != 2;
         if mode == WATCHED_GUARDED {
             let ge = crate::watch::region_epoch(from, to);
             {
@@ -1566,23 +1578,41 @@ fn new_tile() -> Option<Tile> {
     })
 }
 
-/// Whether tiles are given back (`VICTORY_SWEEP_TILES=1`).
-// shortcut: off, for the copies' memory only grows; what still uses a tile
-// does not always say so, and the host GPU stopped about when the first
-// tiles of the world were given back (120 frames in).
-fn sweeps() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cfg!(test) || std::env::var("VICTORY_SWEEP_TILES").is_ok_and(|v| v == "1"))
+/// Which tiles are given back (`VICTORY_SWEEP_TILES`): 0 none, 1 those
+/// nothing has asked about for 120 frames, 2 those nothing has asked about
+/// for 600 frames AND whose title memory is no longer there.
+// shortcut: 0 by default, so the copies' memory only grows (3.8 GB of tiles
+// after a quarter of an hour's drive, 2026-11-25). With 1 the host GPU
+// stopped about when the first tiles of the world were given back: what
+// still uses a tile does not always say so. 2 gives back only what the
+// title itself has unmapped, which nothing of its own may read any more.
+fn sweeps() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if cfg!(test) {
+            return 1;
+        }
+        std::env::var("VICTORY_SWEEP_TILES").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
 }
 
 /// Gives back the tiles nothing has asked about for some frames: what
 /// viewed them is gone. At the present of `frame`.
 pub(crate) fn sweep(frame: u64) {
     const EVERY: u64 = 32;
-    const KEEP: u64 = 120;
-    if !frame.is_multiple_of(EVERY) || !sweeps() {
+    let mode = sweeps();
+    if !frame.is_multiple_of(EVERY) || mode == 0 {
         return;
     }
+    // Once a frame, whoever asks.
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if LAST.swap(frame, Ordering::Relaxed) == frame {
+        return;
+    }
+    let gone_only = mode >= 2;
+    let keep: u64 = if gone_only { 600 } else { 120 };
+    let mut given = 0u64;
+    let started = std::time::Instant::now();
     let all: Vec<Arc<Shadow>> = SPARSE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1595,22 +1625,57 @@ pub(crate) fn sweep(frame: u64) {
         if !shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
             continue;
         }
+        // Those old enough, taken under the lock; whether their title memory
+        // is gone is asked of the system outside it, a region at a time (one
+        // question answers for every tile of an unmapped region); then those
+        // still as they were are taken out.
+        let mut candidates: Vec<(u32, u64)> = {
+            let tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+            let kept = s.kept.lock().unwrap_or_else(|e| e.into_inner());
+            tiles
+                .iter()
+                .filter(|(at, t)| t.used + keep < frame && !kept.contains(at))
+                .map(|(&at, t)| (at, t.used))
+                .collect()
+        };
+        if gone_only && !candidates.is_empty() {
+            candidates.sort_unstable();
+            let mut gone_until = 0usize;
+            candidates.retain(|&(at, _)| {
+                let address = shadow.start as usize + at as usize * PAGE;
+                if address + PAGE <= gone_until {
+                    return true;
+                }
+                match unmapped(address) {
+                    Some(end) => {
+                        gone_until = end;
+                        address + PAGE <= end
+                    }
+                    None => false,
+                }
+            });
+        }
+        if candidates.is_empty() {
+            continue;
+        }
         let old: Vec<(u32, Tile)> = {
             let mut tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
             let kept = s.kept.lock().unwrap_or_else(|e| e.into_inner());
-            let old: Vec<(u32, Tile)> = tiles
-                .iter()
-                .filter(|(at, t)| t.used + KEEP < frame && !kept.contains(at))
-                .map(|(&at, &t)| (at, t))
-                .collect();
-            for (at, _) in &old {
-                tiles.remove(at);
+            let mut old = Vec::new();
+            for (at, used) in candidates {
+                if !kept.contains(&at)
+                    && tiles.get(&at).is_some_and(|t| t.used == used)
+                    && let Some(t) = tiles.remove(&at)
+                {
+                    old.push((at, t));
+                }
             }
             old
         };
         if old.is_empty() {
             continue;
         }
+        given += old.len() as u64;
         {
             let mut looks = s.looks.lock().unwrap_or_else(|e| e.into_inner());
             for (at, _) in &old {
@@ -1646,6 +1711,16 @@ pub(crate) fn sweep(frame: u64) {
             .unwrap_or_else(|e| e.into_inner())
             .free
             .extend(old.into_iter().map(|o| o.1));
+    }
+    let took = started.elapsed();
+    if given > 0 || took > std::time::Duration::from_millis(20) {
+        tracing::info!(
+            tiles = given,
+            megabytes = given * PAGE as u64 >> 20,
+            frame,
+            ms = took.as_millis() as u64,
+            "tiles given back"
+        );
     }
 }
 
@@ -1903,74 +1978,138 @@ impl Shadow {
         None
     }
 
-    /// [`Shadow::writing`] of a sparse copy.
-    fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
-        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+    /// The CPU's views of each tile's part of `[from, to)`: its title
+    /// address, the view, its length. Tiles already mapped are found under
+    /// one lock (the world declares ~160 GB of ranges a frame: one lock per
+    /// 64 KiB tile was a tenth of the submitting thread's time).
+    fn tiles_of(&self, s: &Sparse, from: usize, to: usize) -> Vec<(usize, usize, usize)> {
         let start = self.start as usize;
-        #[cfg(feature = "diagnostics")]
-        SPARSE_WRITES[0].fetch_add(len as u64, Ordering::Relaxed);
-        self.each_tile(s, address, address + len, |at, data, _| {
-            let tile = ((at - start) / PAGE) as u32;
-            before.entry(tile).or_insert_with(|| {
-                #[cfg(feature = "diagnostics")]
-                SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
-                let whole = data as usize & !(PAGE - 1);
-                let mut buf = pooled_tile();
-                // SAFETY: the tile's mapping.
-                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
-                buf
-            });
-        });
+        let mut views = Vec::with_capacity((to - from).div_ceil(PAGE) + 1);
+        let mut missing = Vec::new();
+        {
+            let mut tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+            let frame = crate::queue::presented();
+            let mut at = from;
+            while at < to {
+                let n = (PAGE - at % PAGE).min(to - at);
+                match tiles.get_mut(&(((at - start) / PAGE) as u32)) {
+                    Some(t) => {
+                        t.used = frame;
+                        views.push((at, t.data + at % PAGE, n));
+                    }
+                    None => missing.push((at, n)),
+                }
+                at += n;
+            }
+        }
+        for (at, n) in missing {
+            if let Some(data) = self.tile(s, at) {
+                views.push((at, data + at % PAGE, n));
+            }
+        }
+        views
     }
 
-    /// [`Shadow::copy_back`] of a sparse copy.
-    fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
+    /// [`Shadow::writing`] of a sparse copy. A range inside one already
+    /// declared for this submission has its tiles' snapshots taken; new
+    /// snapshots are copied on several threads (hundreds of MB a frame).
+    fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
+        let end = address + len;
+        let covered = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let covered = pending.iter().any(|&(a, b)| a <= address && end <= b);
+            pending.push((address, end));
+            covered
+        };
+        #[cfg(feature = "diagnostics")]
+        SPARSE_WRITES[0].fetch_add(len as u64, Ordering::Relaxed);
+        if covered {
+            return;
+        }
+        let views = self.tiles_of(s, address, end);
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
-        let mut written = 0;
-        let mut title: Option<Vec<u8>> = None;
-        self.each_tile(s, address, address + len, |at, data, n| {
-            let Some(old) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
-                return;
-            };
-            let old = &mut old[at % PAGE..at % PAGE + n];
-            // SAFETY: the tile's mapping; only this thread writes it.
-            let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
-            #[cfg(feature = "diagnostics")]
-            SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
-            if host == old {
-                return;
-            }
-            #[cfg(feature = "diagnostics")]
-            SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
-            let buf = title.get_or_insert_with(|| {
-                let mut v = pooled(PAGE);
-                v.resize(PAGE, 0);
-                v
-            });
-            if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
-                return;
-            }
-            if let Some((dirty_start, dirty_end)) =
-                merge_gpu_writes_mut(&mut buf[..n], host, old)
-            {
-                let dirty_len = dirty_end - dirty_start;
-                crate::watch::writing(at + dirty_start, dirty_len);
-                crate::host::write_mapped(
-                    (at + dirty_start) as *mut u8,
-                    buf[dirty_start..].as_ptr(),
-                    dirty_len,
-                );
-                written += dirty_len;
+        // (tile, the start of its view) of tiles without a snapshot yet.
+        let new: Vec<(u32, usize)> = views
+            .iter()
+            .map(|&(at, data, _)| (((at - start) / PAGE) as u32, data & !(PAGE - 1)))
+            .filter(|(tile, _)| !before.contains_key(tile))
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        SPARSE_WRITES[1].fetch_add((new.len() * PAGE) as u64, Ordering::Relaxed);
+        let mut bufs = pooled_tiles(new.len());
+        let copies: Vec<(usize, usize)> =
+            new.iter().zip(&mut bufs).map(|(&(_, view), buf)| (view, buf.as_mut_ptr() as usize)).collect();
+        crate::host::in_parallel(&copies, 16, |chunk| {
+            for &(view, buf) in chunk {
+                // SAFETY: the tile's mapping; a buffer with room for a tile,
+                // each written by one thread.
+                unsafe { std::ptr::copy_nonoverlapping(view as *const u8, buf as *mut u8, PAGE) };
             }
         });
-        if let Some(buf) = title {
-            give_back(buf);
+        for (&(tile, _), mut buf) in new.iter().zip(bufs) {
+            // SAFETY: filled above, within its capacity.
+            unsafe { buf.set_len(PAGE) };
+            before.insert(tile, buf);
         }
+    }
+
+    /// [`Shadow::copy_back`] of a sparse copy, its tiles on several threads.
+    fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
+        let views = self.tiles_of(s, address, address + len);
+        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+        let start = self.start as usize;
+        // (title address, view, length, the snapshot's bytes): one tile each,
+        // so no two touch the same memory.
+        let work: Vec<(usize, usize, usize, usize)> = views
+            .iter()
+            .filter_map(|&(at, data, n)| {
+                let old = before.get_mut(&(((at - start) / PAGE) as u32))?;
+                Some((at, data, n, old.as_mut_ptr() as usize + at % PAGE))
+            })
+            .collect();
+        let written = std::sync::atomic::AtomicUsize::new(0);
+        crate::host::in_parallel(&work, 8, |chunk| {
+            let mut title: Option<Vec<u8>> = None;
+            for &(at, data, n, old) in chunk {
+                // SAFETY: the tile's mapping and its snapshot (kept under the
+                // lock held above); this tile is this thread's alone.
+                let host = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, n) };
+                let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
+                #[cfg(feature = "diagnostics")]
+                SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+                if host == old {
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
+                let buf = title.get_or_insert_with(|| {
+                    let mut v = pooled(PAGE);
+                    v.resize(PAGE, 0);
+                    v
+                });
+                if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
+                    continue;
+                }
+                if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old) {
+                    let dirty_len = dirty_end - dirty_start;
+                    crate::watch::writing(at + dirty_start, dirty_len);
+                    crate::host::write_mapped(
+                        (at + dirty_start) as *mut u8,
+                        buf[dirty_start..].as_ptr(),
+                        dirty_len,
+                    );
+                    written.fetch_add(dirty_len, Ordering::Relaxed);
+                }
+            }
+            if let Some(buf) = title {
+                give_back(buf);
+            }
+        });
+        let written = written.into_inner();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty() {

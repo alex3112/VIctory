@@ -40,7 +40,9 @@ pub(crate) struct HostHeap {
     kept_textures: Mutex<HashMap<u32, Arc<crate::resource::HostTexture>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Where the next search starts, the slots taken, and the smallest run
+    /// known not to be free since the last release (`usize::MAX`: none).
+    next: Mutex<(u32, Vec<bool>, usize)>,
     /// Per-slot element byte stride (`u32`) for structured buffers whose
     /// stride shader analysis could not recover statically.
     strides: Option<StrideTable>,
@@ -645,7 +647,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             kept_textures: Mutex::default(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, vec![false; extra as usize], usize::MAX)),
             strides,
             bindless: Mutex::default(),
             recording: std::sync::atomic::AtomicBool::new(false),
@@ -782,8 +784,26 @@ impl HostHeap {
         }
         let spare = self.spare as usize;
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
+        let (next, taken, no_run) = &mut *guard;
         let n = n as usize;
+        // A search that found no run of this size (or of a smaller one)
+        // since the last release finds none now: without this, each table
+        // of a frame that does not fit walked all the slots again, and a
+        // heavy place took 7 to 11 seconds a frame (runs sw1, sw2).
+        if n >= *no_run {
+            return None;
+        }
+        // Releases come all the time and each allows a search again: no
+        // more than a few failed walks a frame.
+        static FAILED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        const WALKS: u64 = 8;
+        let frame = crate::queue::presented();
+        if FAILED[0].swap(frame, Ordering::Relaxed) != frame {
+            FAILED[1].store(0, Ordering::Relaxed);
+        }
+        if FAILED[1].load(Ordering::Relaxed) >= WALKS {
+            return None;
+        }
         // Search from `next` on, then from the start.
         let starts = (*next as usize..spare).chain(0..*next as usize);
         let mut run = 0;
@@ -804,6 +824,8 @@ impl HostHeap {
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
+            *no_run = n;
+            FAILED[1].fetch_add(1, Ordering::Relaxed);
             return None;
         };
         taken[first..first + n].fill(true);
@@ -839,6 +861,7 @@ impl HostHeap {
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             slots.fill(false);
         }
+        guard.2 = usize::MAX;
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
