@@ -215,7 +215,8 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// Textures a bindless slot began to view, to upload before anything of the
 /// next submission runs: every list reads the slot, not only the one whose
 /// recording made it.
-static FIRST: Mutex<Vec<(Arc<Staging>, Arc<crate::resource::HostTexture>)>> = Mutex::new(Vec::new());
+type FirstUploads = HashMap<usize, (Arc<Staging>, Arc<crate::resource::HostTexture>)>;
+static FIRST: Mutex<Option<FirstUploads>> = Mutex::new(None);
 
 /// A bindless slot views `resource` from now on.
 pub(crate) fn upload_first(resource: This, texture: &ID3D12Resource) {
@@ -230,13 +231,17 @@ pub(crate) fn upload_first(resource: This, texture: &ID3D12Resource) {
     if let Some(copy) = crate::resource::host_copy(resource)
         && let Some(staging) = staging(resource, texture)
     {
-        FIRST.lock().unwrap_or_else(|e| e.into_inner()).push((staging, copy));
+        let key = Arc::as_ptr(&copy) as usize;
+        let old = FIRST.lock().unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new).insert(key, (staging, copy));
+        drop(old);
     }
 }
 
 /// The textures of [`upload_first`] since the last call.
 pub(crate) fn take_first() -> Vec<(Arc<Staging>, Arc<crate::resource::HostTexture>)> {
-    std::mem::take(&mut *FIRST.lock().unwrap_or_else(|e| e.into_inner()))
+    FIRST.lock().unwrap_or_else(|e| e.into_inner()).take()
+        .map(|uploads| uploads.into_values().collect()).unwrap_or_default()
 }
 
 /// Registers a title-written texture with `list` (once per list) so that at

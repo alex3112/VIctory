@@ -287,7 +287,7 @@ pub(crate) fn reap_parted() {
         let mut parted = PARTED.lock().unwrap_or_else(|e| e.into_inner());
         let mut i = 0;
         while i < parted.len() {
-            if Arc::strong_count(&parted[i].0) == 1 {
+            if Arc::strong_count(&parted[i].0) == 1 && parted[i].0.recyclable() {
                 idle += 1;
                 if idle > IDLE_CACHE {
                     released.push(parted.swap_remove(i));
@@ -309,19 +309,25 @@ fn spare() -> Option<Arc<crate::host::HostList>> {
     let mut parted = PARTED.lock().unwrap_or_else(|e| e.into_inner());
     let spare = parted
         .iter()
-        .position(|l| Arc::strong_count(&l.0) == 1)
+        .position(|l| Arc::strong_count(&l.0) == 1 && l.0.recyclable())
         .map(|i| parted.swap_remove(i).0);
     drop(parted);
     if let Some(list) = spare {
-        list.release_kept();
         list.reset();
         return Some(list);
     }
-    let made = crate::host::host()?.new_list();
+    let host = crate::host::host()?;
+    let made = host.new_list();
     match made {
         #[allow(clippy::arc_with_non_send_sync)] // see `Submitted`
         Ok(list) => Some(Arc::new(list)),
         Err(error) => {
+            crate::audit::record_memory_failure("host command list", 0, &error.to_string());
+            // Do not continue generating resources after device removal
+            // and misreport the failure to the title as ordinary OOM.
+            if let Err(reason) = unsafe { host.device.GetDeviceRemovedReason() } {
+                crate::host::fail(format_args!("host command list creation failed: {error}; {reason}"));
+            }
             tracing::warn!(%error, "no host command list");
             None
         }
@@ -331,15 +337,24 @@ fn spare() -> Option<Arc<crate::host::HostList>> {
 #[cfg(windows)]
 impl Drop for List {
     fn drop(&mut self) {
-        // What a submission still to run needs of the list.
-        if let Some(host) = self.host.get_mut()
-            && Arc::strong_count(host) > 1
-        {
-            host.keep_until_run(Box::new((
-                std::mem::take(&mut self.uploads),
-                std::mem::take(&mut self.state),
-            )));
+        // Every split recording can still be pending, not only the last.
+        // Its dynamic tables and title uploads must survive together.
+        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        state.end_hoist();
+        let host = self.host.get_mut();
+        let parts = self.parts.get_mut();
+        if parts.iter().chain(host.iter()).any(|h| Arc::strong_count(h) > 1 || !h.recyclable()) {
+            let uploads = self.uploads.get_mut().unwrap_or_else(|e| e.into_inner());
+            let retained = Arc::new(std::sync::Mutex::new((std::mem::take(uploads), std::mem::take(state))));
+            for h in parts.iter().chain(host.iter()) {
+                if Arc::strong_count(h) > 1 || !h.recyclable() {
+                    h.keep_until_run(Box::new(retained.clone()));
+                }
+            }
         }
+        // Closed split recordings can be reused by any title list.
+        // The final list might still be open; don't pool it here.
+        PARTED.lock().unwrap_or_else(|e| e.into_inner()).extend(parts.drain(..).map(Submitted));
     }
 }
 
@@ -417,15 +432,7 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         uploads: Default::default(),
         #[cfg(windows)]
         #[allow(clippy::arc_with_non_send_sync)] // see `Submitted`
-        host: crate::host::host()
-            .and_then(|h| match h.new_list() {
-                Ok(list) => Some(Arc::new(list)),
-                Err(e) => {
-                    tracing::warn!(error = %e, "no host command list");
-                    None
-                }
-            })
-            .into(),
+        host: spare().into(),
         #[cfg(windows)]
         parts: Default::default(),
         #[cfg(windows)]
@@ -484,15 +491,23 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         state.end_hoist();
         // SAFETY: as above.
         let parts = unsafe { &mut *(*this.cast::<List>()).parts.get() };
+        let host_pending = host.as_ref().is_some_and(|h| Arc::strong_count(h) > 1 || !h.recyclable());
+        if host_pending || parts.iter().any(|h| Arc::strong_count(h) > 1 || !h.recyclable()) {
+            let retained = Arc::new(std::sync::Mutex::new((std::mem::take(&mut *uploads), std::mem::take(&mut *state))));
+            for h in parts.iter().chain(host.iter()) {
+                if Arc::strong_count(h) > 1 || !h.recyclable() {
+                    h.keep_until_run(Box::new(retained.clone()));
+                }
+            }
+        }
         {
             let mut parted = PARTED.lock().unwrap_or_else(|e| e.into_inner());
             parted.extend(parts.drain(..).map(Submitted));
+            if host_pending && let Some(old) = host.take() {
+                parted.push(Submitted(old));
+            }
         }
-        if let Some(old) = host.take_if(|h| Arc::strong_count(h) > 1) {
-            // A submission of it is still to run, with the memory and the
-            // descriptors it was recorded with.
-            old.keep_until_run(Box::new((std::mem::take(&mut *uploads), std::mem::take(&mut *state))));
-            PARTED.lock().unwrap_or_else(|e| e.into_inner()).push(Submitted(old));
+        if host_pending {
             *host = spare();
             if host.is_none() {
                 return crate::object::E_OUTOFMEMORY;

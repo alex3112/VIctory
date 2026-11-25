@@ -2,11 +2,11 @@
 //! back behind a wait (for a fence, or for a value a list waits for in
 //! memory) until that is met.
 //!
-//! Production Windows queues are pumped by one host worker, not by the
-//! title thread that enqueues commands. The host device already serializes
-//! its submissions. Ready operations advance round-robin across timelines;
-//! no fence signal is published before its preceding work completes.
-//! VICTORY_QUEUE_WORKER=0 restores the original inline execution path.
+//! Ready operations advance round-robin across timelines. By default
+//! producers help execute ready work inline, providing natural backpressure
+//! instead of racing ahead of a stalled single host worker. A queue with an
+//! unmet dependency still returns to its caller. VICTORY_QUEUE_WORKER=1
+//! opts into the experimental dedicated worker.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -85,7 +85,7 @@ fn worker() -> Option<&'static std::thread::Thread> {
     static WORKER: OnceLock<Option<std::thread::Thread>> = OnceLock::new();
     WORKER.get_or_init(|| {
         if !cfg!(windows) || cfg!(test)
-            || std::env::var("VICTORY_QUEUE_WORKER").is_ok_and(|v| v == "0")
+            || !std::env::var("VICTORY_QUEUE_WORKER").is_ok_and(|v| v == "1")
         {
             return None;
         }
@@ -99,8 +99,7 @@ fn worker() -> Option<&'static std::thread::Thread> {
                 }
                 #[cfg(windows)]
                 if maintenance.elapsed() >= Duration::from_millis(250) {
-                    crate::list::reap_parted();
-                    crate::host::collect_retired();
+                    maintenance_tick();
                     maintenance = Instant::now();
                 }
                 #[cfg(not(windows))]
@@ -310,6 +309,30 @@ pub(crate) fn pump() {
 fn pump_inline() {
     while pump_round() {
         crate::fence::wake();
+        #[cfg(windows)]
+        maintenance_tick();
+    }
+}
+
+/// Also reclaim completed objects on the inline path. Never hold a queue
+/// mutex or the maintenance timer while dropping resources.
+#[cfg(windows)]
+fn maintenance_tick() {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let due = match LAST.try_lock() {
+        Ok(mut last) => {
+            if last.is_none_or(|at| at.elapsed() >= Duration::from_millis(250)) {
+                *last = Some(Instant::now());
+                true
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    };
+    if due {
+        crate::list::reap_parted();
+        crate::host::collect_retired();
     }
 }
 
@@ -380,9 +403,9 @@ fn force() {
     let Some((since, queue)) = oldest.filter(|(since, _)| since.elapsed() > LIMIT) else {
         return;
     };
-    // Do not silently skip a real dependency in worker mode. The legacy
-    // escape hatch remains explicit for debugging titles with missing writes.
-    let allow_force = worker().is_none()
+    // Do not silently skip a real dependency in either scheduling mode.
+    // The escape hatch remains explicit for debugging missing writes.
+    let allow_force = cfg!(test)
         || std::env::var("VICTORY_FORCE_WAITS").is_ok_and(|v| v == "1");
     if !allow_force {
         static LAST_REPORT: Mutex<Option<Instant>> = Mutex::new(None);

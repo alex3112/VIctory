@@ -876,9 +876,34 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = at.saturating_add(n).min(self.spare) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            // The recording's owner releases these only after its last
+            // submission. Drop descriptor owners before exposing the slots
+            // to another recorder. The resource retirement grace still
+            // applies; no live title slot is touched.
+            let mut resources = Vec::new();
+            let mut textures = Vec::new();
+            {
+                let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+                let mut texs = self.kept_textures.lock().unwrap_or_else(|e| e.into_inner());
+                for i in at as usize..end {
+                    if let Some(r) = kept.get_mut(self.count as usize + i).and_then(Option::take) {
+                        resources.push(r);
+                    }
+                    if let Some(t) = texs.remove(&(self.count + i as u32)) {
+                        textures.push(t);
+                    }
+                }
+            }
             slots.fill(false);
+            guard.2 = usize::MAX;
+            drop(guard);
+            for r in resources {
+                crate::host::retire(r);
+            }
+            // HostTexture::drop already retires the resource and pool slot.
+            // Do not retain this Arc for another full grace period.
+            drop(textures);
         }
-        guard.2 = usize::MAX;
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -989,12 +1014,19 @@ impl HostHeap {
         // this slot; it is retired outside the lock.
         let old = {
             let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            kept.get_mut(index as usize)
-                .and_then(|slot| std::mem::replace(slot, resource))
+            use windows::core::Interface;
+            kept.get_mut(index as usize).and_then(|slot| {
+                if slot.as_ref().zip(resource.as_ref()).is_some_and(|(a,b)| a.as_raw() == b.as_raw()) {
+                    None
+                } else {
+                    std::mem::replace(slot, resource)
+                }
+            })
         };
         let old_tex = {
             let mut texs = self.kept_textures.lock().unwrap_or_else(|e| e.into_inner());
             match texture {
+                Some(t) if texs.get(&index).is_some_and(|old| Arc::ptr_eq(old, &t)) => None,
                 Some(t) => texs.insert(index, t),
                 None => texs.remove(&index),
             }
@@ -1002,9 +1034,9 @@ impl HostHeap {
         if let Some(old) = old {
             crate::host::retire(old);
         }
-        if let Some(old_tex) = old_tex {
-            crate::host::retire(old_tex);
-        }
+        // The last HostTexture owner retires its COM resource and pool slot
+        // itself. A second frame-based Arc retirement only doubles retention.
+        drop(old_tex);
     }
 
     fn set_stride(&self, index: u32, stride: u32) {
@@ -1148,8 +1180,13 @@ impl HostHeap {
             b.placed_set.remove(&index).is_some()
         };
         if changed {
-            b.record_pending.insert(index);
-            self.record_hint.store(true, Ordering::Release);
+            if placed {
+                b.record_pending.insert(index);
+                self.record_hint.store(true, Ordering::Release);
+            } else {
+                b.record_pending.remove(&index);
+                b.recorded.remove(&index);
+            }
         }
     }
 
@@ -1163,11 +1200,20 @@ impl HostHeap {
         }
         if b.placed_set.remove(&index).is_some() {
             b.recorded.remove(&index);
+            b.record_pending.remove(&index);
         }
     }
 
     /// Slot `index` (viewing `entry`) is no longer one for bindless access.
     fn drop_bindless(&self, b: &mut Bindless, index: u32, entry: Option<(u32, u32)>) {
+        if entry.is_some_and(|e| b.slots.get(&index) != Some(&e)) {
+            // The title rewrote the slot while it was being resolved.
+            // Don't discard its new generation as though it were stale.
+            if b.slots.contains_key(&index) {
+                b.note_recent(index);
+            }
+            return;
+        }
         b.uses.remove(&index);
         b.busy.remove(&index);
         b.unmapped_slots.remove(&index);
@@ -1179,6 +1225,7 @@ impl HostHeap {
                 bounce.active = false;
             }
             b.placed_set.remove(&index);
+            b.record_pending.remove(&index);
         }
     }
 
@@ -1492,7 +1539,7 @@ impl HostHeap {
                     reached.push(t);
                 }
                 Ok(None) => {}
-                Err(()) => stale.push(index),
+                Err(()) => stale.push((index, (vi, generation))),
             }
         }
         over.extend(todo.map(|(i, _)| i));
@@ -1519,11 +1566,22 @@ impl HostHeap {
         }
         {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-            b.recorded.extend(learnt);
-            for idx in stale {
-                self.drop_bindless(&mut b, idx, None);
+            for (idx, (key, texture)) in learnt {
+                let entry = (key as u32, (key >> 32) as u32);
+                if b.placed_set.get(&idx) == Some(&entry) {
+                    b.recorded.insert(idx, (key, texture));
+                } else if b.placed_set.contains_key(&idx) {
+                    b.record_pending.insert(idx);
+                }
             }
-            b.record_pending.extend(over);
+            for (idx, entry) in stale {
+                self.drop_bindless(&mut b, idx, Some(entry));
+            }
+            for idx in over {
+                if b.placed_set.contains_key(&idx) {
+                    b.record_pending.insert(idx);
+                }
+            }
             self.record_hint
                 .store(!b.record_pending.is_empty(), Ordering::Release);
         }
@@ -1768,6 +1826,12 @@ impl HostHeap {
         self.budget_spend(0, started.elapsed().as_micros() as u64);
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         for (index, made) in results {
+            if b.slots.get(&index).copied() != made.as_ref().map(|(entry, _)| *entry) {
+                // Results prepared outside the lock must still describe the
+                // current generation. A changed slot needs fresh preparation.
+                b.note_recent(index);
+                continue;
+            }
             match made {
                 None => {
                     b.uses.remove(&index);

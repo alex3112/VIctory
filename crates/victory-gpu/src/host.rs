@@ -253,6 +253,9 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
+    if crate::audit::enabled() {
+        text.push_str(&format!("; {}", crate::audit::submission_state()));
+    }
     if let Some(host) = host() {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
@@ -1228,13 +1231,17 @@ impl Host {
         unsafe {
             if self.fence.GetCompletedValue() < target {
                 if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
-                    tracing::warn!(error = %e, "host fence wait failed");
+                    fail(format_args!("host fence wait failed: {e}"));
                 } else {
                     let wait_started = crate::audit::timer();
                     WaitForSingleObject(self.event, INFINITE);
                     crate::audit::elapsed(crate::audit::C::FenceWaitUs, wait_started);
                 }
             }
+        }
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed < target || completed == u64::MAX {
+            fail(format_args!("host fence {target} incomplete ({completed})"));
         }
         self.reap_completed();
     }
@@ -1270,7 +1277,7 @@ impl Host {
             if self.fence.GetCompletedValue() < target {
                 let waited = std::time::Instant::now();
                 if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
-                    tracing::warn!(error = %e, "host async drain failed");
+                    fail(format_args!("host async drain failed: {e}"));
                 } else {
                     let wait_started = crate::audit::timer();
                     WaitForSingleObject(self.event, INFINITE);
@@ -1278,6 +1285,10 @@ impl Host {
                 }
                 SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
+        }
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed < target || completed == u64::MAX {
+            fail(format_args!("host async fence {target} incomplete ({completed})"));
         }
         self.reap_completed();
     }
@@ -1337,6 +1348,7 @@ impl Host {
         let lock_started = crate::audit::timer();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         crate::audit::elapsed(crate::audit::C::SubmitLockUs, lock_started);
+        let trace = crate::audit::SubmissionTrace::begin(STARTED.load(Ordering::Acquire) + 1, runs.len());
         // Wait for any previous async submission before mutating shared Shadow
         // buffers in `prepare`. During the gap between submissions, the GPU
         // ran in parallel with the title's CPU command-list recording, and
@@ -1354,22 +1366,28 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         let mut early = Early::default();
+        trace.phase("early_upload_refresh", 0, 0);
         if !runs.is_empty() {
             early.take(&mut batch, runs, false);
         }
-        for list in runs {
+        for (i, list) in runs.iter().enumerate() {
+            trace.phase("deferred_copies", i + 1, 0);
             let uploads = list.run_deferred(&mut batch);
+            trace.phase("prelude_record", i + 1, 0);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude(&uploads) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
         }
+        trace.phase("bindless_prepare", 0, 0);
         batch.prepare_bindless();
+        trace.phase("late_upload_refresh", 0, 0);
         if !runs.is_empty() {
             early.take(&mut batch, runs, true);
         }
         // The textures live (in `early`) until the submission is done.
+        trace.phase("upload_record", 0, 0);
         let first = early.record(self);
         // Deduplicate GPU write ranges once before execution so VRAM card
         // shadows get pre-uploaded / Wave64-hashed in the same GPU wait.
@@ -1401,6 +1419,7 @@ impl Host {
                 target.push((shadow, address, len));
             }
         }
+        trace.phase("card_prepare", 0, 0);
         let (card_before, card_plan, mut card_after) =
             if self.card.get().and_then(|o| o.as_ref()).is_some() || !card_writes.is_empty() {
                 if let Some(engine_lock) = self.card_engine() {
@@ -1439,10 +1458,12 @@ impl Host {
             && !each
             && async_submit()
             && card_writes.is_empty();
+        trace.phase("execute_uploads", 0, 0);
         if let Some(first) = first {
             // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&[Some(first)]) };
         }
+        trace.phase("execute_card_before", 0, 0);
         if let Some(card_before) = card_before {
             // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&[Some(card_before)]) };
@@ -1458,6 +1479,9 @@ impl Host {
             }
             *submitted += 1;
             let started = std::time::Instant::now();
+            trace.pipelines(|| runs[i].pipelines.lock().unwrap_or_else(|e| e.into_inner())
+                .iter().take(32).cloned().collect::<Vec<_>>().join(","));
+            trace.phase("execute_lists", i + 1, *submitted);
             // SAFETY: closed lists.
             unsafe { self.queue.ExecuteCommandLists(group) };
             if !each && i + 1 < groups.len() {
@@ -1466,12 +1490,14 @@ impl Host {
             if !each
                 && let Some(after) = card_after.take()
             {
+                trace.phase("execute_card_after", i + 1, *submitted);
                 // SAFETY: closed list; runs immediately after the final group under the same fence.
                 unsafe { self.queue.ExecuteCommandLists(&[Some(after)]) };
                 card_after_ran = true;
             }
             *submitted += 1;
             let fence_val = *submitted;
+            trace.phase("host_fence", i + 1, fence_val);
             if can_async {
                 // SAFETY: the fence is ours.
                 if let Err(e) = unsafe { self.queue.Signal(&self.fence, fence_val) } {
@@ -1522,6 +1548,7 @@ impl Host {
             let _ = (i, started);
         }
         if let Some(after) = card_after.take() {
+            trace.phase("card_after_wait", 0, *submitted);
             #[cfg(feature = "diagnostics")]
             let skip = no_work();
             #[cfg(not(feature = "diagnostics"))]
@@ -1579,6 +1606,7 @@ impl Host {
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
+        trace.phase("card_copy_back", 0, *submitted);
         let copying = std::time::Instant::now();
         if let Some(plan) = card_plan {
             if card_after_ran {
@@ -1594,7 +1622,9 @@ impl Host {
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        trace.phase("cpu_copy_back_and_signals", 0, *submitted);
         self.finish_submission(runs, cpu_back);
+        trace.phase("retirement", 0, *submitted);
         // Never recycle upload memory on the basis of a failed host wait.
         // A subsequent successful fence covers all earlier queue work.
         let completed = unsafe { self.fence.GetCompletedValue() };
@@ -2066,6 +2096,13 @@ impl HostList {
         drop(kept);
     }
 
+    /// A pooled recording can be reused only once its last async fence
+    /// has also completed the CPU copy-back, not just the GPU execution.
+    pub(crate) fn recyclable(&self) -> bool {
+        let fence = self.last_fence.load(Ordering::Acquire);
+        fence == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= fence
+    }
+
     /// Only after the list's last submission finished.
     pub(crate) fn reset(&self) {
         let fence = self.last_fence.load(Ordering::Acquire);
@@ -2074,6 +2111,7 @@ impl HostList {
         {
             h.wait_fence(fence);
         }
+        self.last_fence.store(0, Ordering::Release);
         self.release_kept();
         *self.deferred() = Deferred::default();
         *self.work.lock().unwrap_or_else(|e| e.into_inner()) = 0;

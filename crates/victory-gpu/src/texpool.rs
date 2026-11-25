@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// Textures larger than this have memory of their own.
@@ -15,6 +16,7 @@ struct Slab {
     memory: Option<Memory>,
     free: Vec<u32>,
     slots: u32,
+    bytes: u64,
 }
 
 #[derive(Clone)]
@@ -31,6 +33,18 @@ unsafe impl Send for Memory {}
 /// Slot size, and whether for staging, to slabs of such slots.
 type Slabs = BTreeMap<(u64, bool), Vec<Slab>>;
 static SLABS: Mutex<Slabs> = Mutex::new(BTreeMap::new());
+/// This is an idle-cache budget, never a cap on live textures or allocations.
+const IDLE_BUDGET: u64 = 64 << 20;
+static IDLE_BYTES: AtomicU64 = AtomicU64::new(0);
+static SLABS_MADE: AtomicU64 = AtomicU64::new(0);
+static SLABS_REUSED: AtomicU64 = AtomicU64::new(0);
+static SLABS_FREED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn audit_state() -> String {
+    format!("pool_idle_mib={} pool_slabs_made={} pool_slabs_reused={} pool_slabs_freed={}",
+        IDLE_BYTES.load(Relaxed) >> 20, SLABS_MADE.load(Relaxed),
+        SLABS_REUSED.load(Relaxed), SLABS_FREED.load(Relaxed))
+}
 
 /// A texture's memory, free again when dropped.
 pub(crate) struct Slot {
@@ -43,20 +57,30 @@ impl Drop for Slot {
     fn drop(&mut self) {
         let retired = {
             let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(s) = slabs.get_mut(&self.size).and_then(|v| v.get_mut(self.heap)) {
-                s.free.push(self.index);
-                if s.free.len() == s.slots as usize {
-                    s.memory.take()
-                } else {
-                    None
-                }
+            if let Some(of) = slabs.get_mut(&self.size) {
+                let another_idle = of.iter().enumerate().any(|(i,s)|
+                    i != self.heap && s.memory.is_some() && s.free.len() == s.slots as usize);
+                if let Some(s) = of.get_mut(self.heap) {
+                    s.free.push(self.index);
+                    if s.free.len() == s.slots as usize && s.memory.is_some() {
+                        if !another_idle && IDLE_BYTES.load(Relaxed).saturating_add(s.bytes) <= IDLE_BUDGET {
+                            IDLE_BYTES.fetch_add(s.bytes, Relaxed);
+                            None
+                        } else {
+                            SLABS_FREED.fetch_add(1, Relaxed);
+                            s.memory.take()
+                        }
+                    } else {
+                        None
+                    }
+                } else { None }
             } else {
                 None
             }
         };
-        if let Some(mem) = retired {
-            crate::host::retire(mem);
-        }
+        // A slot reaches Drop only after its resource owner is retired
+        // (or creation failed). Empty slabs need no second grace period.
+        drop(retired);
     }
 }
 
@@ -74,30 +98,38 @@ fn class(bytes: u64) -> u64 {
 fn slot(size: (u64, bool), make: impl FnOnce(u64) -> Option<Memory>) -> Option<(Slot, Memory)> {
     let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
     let of = slabs.entry(size).or_default();
-    let used = of.iter().position(|s| s.memory.is_some() && !s.free.is_empty());
+    let used = of.iter().position(|s| s.memory.is_some() && !s.free.is_empty() && s.free.len() < s.slots as usize)
+        .or_else(|| of.iter().position(|s| s.memory.is_some() && !s.free.is_empty()));
     let at = match used.or_else(|| of.iter().position(|s| s.memory.is_none())) {
         Some(at) => at,
         None => {
-            // A rare texture size class need not reserve eight slots before
-            // it has a second user. Grow subsequent slabs normally.
-            let bytes = if !size.1 && of.is_empty() {
-                (size.0 * 2).clamp(256 << 10, 16 << 20)
+            // Start small for rare size classes. Grow only after existing
+            // slabs of this class are full, reducing kernel heap creation.
+            let (count, min, max) = if !size.1 && of.is_empty() {
+                (2, 256 << 10, 16 << 20)
+            } else if !size.1 && of.len() >= 2 {
+                (32, 1 << 20, 32 << 20)
             } else {
-                (size.0 * 8).clamp(1 << 20, 16 << 20)
-            }.next_multiple_of(64 << 10);
+                (8, 1 << 20, 16 << 20)
+            };
+            let bytes = (size.0 * count).clamp(min, max).next_multiple_of(64 << 10);
             let slots = (bytes / size.0) as u32;
             of.push(Slab {
                 memory: None,
                 free: (0..slots).rev().collect(),
                 slots,
+                bytes: (u64::from(slots) * size.0).next_multiple_of(64 << 10),
             });
             of.len() - 1
         }
     };
     let s = &mut of[at];
     if s.memory.is_none() {
-        let bytes = (u64::from(s.slots) * size.0).next_multiple_of(64 << 10);
-        s.memory = Some(make(bytes)?);
+        s.memory = Some(make(s.bytes)?);
+        SLABS_MADE.fetch_add(1, Relaxed);
+    } else if s.free.len() == s.slots as usize {
+        IDLE_BYTES.fetch_sub(s.bytes, Relaxed);
+        SLABS_REUSED.fetch_add(1, Relaxed);
     }
     let index = s.free.pop()?;
     debug_assert!(index < s.slots);

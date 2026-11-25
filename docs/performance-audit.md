@@ -108,3 +108,43 @@ texture/descriptor retirement retains its existing safety grace period; no
 unsafe eviction of live descriptors or sparse memory is enabled. Windows build
 and title runtime validation are required. No game executable patch, watchdog
 bypass, shader disablement or quality changes are introduced.
+
+## GPU Resource Lifecycle (audit v4)
+
+The v3 dedicated queue worker increased producer run-ahead during a stalled
+host submission. Inline pumping is restored as the default, keeping the
+round-robin scheduler and strict dependency handling. Ready work is executed
+on the caller; unmet waits return so that other queues can provide the
+signal. The dedicated worker is experimental (`VICTORY_QUEUE_WORKER=1`).
+Unmet waits are not bypassed unless explicitly enabled for diagnostics.
+This is natural backpressure, not a hard live-resource limit; independent
+recording threads may still allocate while a host fence is stalled.
+
+Split lists retain the original recording's dynamic descriptor tables and
+uploads until every pending part is done. Completed recordings are eligible
+for reuse on initial list creation as well as reset; recycle checks also
+require deferred fence completion. Released dynamic slots drop their retained
+owners instead of holding them until the slot is overwritten. Duplicate
+texture ownership changes no longer retire identical resources again.
+The first-upload queue coalesces entries per host texture.
+
+Texture heaps grow per populated size class and reuse empty slabs. At most
+64 MiB of wholly idle slabs are cached, with one per class. This is solely a
+cache bound; live allocation is not capped. Empty heaps whose final slot
+has already been retired no longer receive a second frame grace period.
+Generic live descriptor and texture retirement protection remains intact.
+
+The independent audit reports live list/heap counts, slab allocation/reuse,
+and active submission stage, list index, fence, elapsed stage time and up
+to 32 pipeline identifiers for the currently issued list. A fence at the end
+of a batch also covers preceding lists; the last listed pipeline is not
+necessarily the one that stalled the device. Windows testing is required.
+
+Descriptor preparation also checks whether the slot generation changed while
+work was done outside the tracking lock; stale results are rescheduled instead
+of removing a new slot. Placed textures under construction revalidate their
+backing memory when a remap intervenes. Creation/remap/rejection/eviction
+counters are reported separately. No LRU eviction of still-mapped textures
+is introduced: safe eviction requires a complete ownership audit of raw
+resource pointers and bindless references. The audit records command-list
+allocation failures and reports device removal rather than masking it as OOM.

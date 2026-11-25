@@ -1682,6 +1682,22 @@ static PLACED_TEXTURES: std::sync::Mutex<PlacedTextureMap> =
 /// bindless heaps re-check placed texture slots.
 #[cfg(windows)]
 static PLACED_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Remaps even when no cached texture overlapped them. A texture under
+/// construction outside the map lock must revalidate before insertion.
+#[cfg(windows)]
+static PLACED_REMAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static PLACED_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static PLACED_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn placed_audit() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    format!("placed_created={} placed_remap_calls={} placed_rejected_after_remap={} placed_eviction_epoch={}",
+        PLACED_CREATED.load(Relaxed), PLACED_REMAPS.load(Relaxed),
+        PLACED_REJECTED.load(Relaxed), PLACED_EPOCH.load(Relaxed))
+}
 
 #[cfg(windows)]
 pub(crate) fn placed_epoch() -> u64 {
@@ -1777,6 +1793,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
         _ => footprint(&d).map_or(1, |info| info.size.max(1)),
     };
     let end = address.saturating_add(size);
+    let remap = PLACED_REMAPS.load(std::sync::atomic::Ordering::Acquire);
     // The title's pages for it may not be there yet (streaming): nothing to
     // show, and the console's whole address space would not fit in memory.
     if !cfg!(test) && !crate::texture::committed(address as *const u8, size as usize) {
@@ -1810,6 +1827,19 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
         resource_release(out);
         return Some(r as This);
     }
+    if !cfg!(test)
+        && remap != PLACED_REMAPS.load(std::sync::atomic::Ordering::Acquire)
+        && !crate::texture::committed(address as *const u8, size as usize)
+    {
+        // A concurrent remap may have run before this entry existed.
+        // Never cache a host copy for memory that disappeared meanwhile.
+        PLACED_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        drop(map);
+        drop(creation);
+        resource_release(out);
+        return None;
+    }
+    PLACED_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner()).insert(out as usize);
     PLACED_LONGEST.fetch_max(end - address, std::sync::atomic::Ordering::AcqRel);
     map.insert((address, *desc), (out as usize, end));
@@ -1903,6 +1933,7 @@ pub(crate) fn evict_placed_textures(start: u64, end: u64) {
     let mut evicted = Vec::new();
     {
         let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        PLACED_REMAPS.fetch_add(1, std::sync::atomic::Ordering::Release);
         let longest = PLACED_LONGEST.load(std::sync::atomic::Ordering::Acquire);
         let from = (start.saturating_sub(longest), [0u32; 14]);
         let over: Vec<_> = map

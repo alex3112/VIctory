@@ -14,6 +14,68 @@ struct Session {
 static SESSION: OnceLock<Session> = OnceLock::new();
 static LOST: AtomicU64 = AtomicU64::new(0);
 
+// Only the serialized host submission writes this snapshot. The audit
+// reader uses try_lock, never a host lock, and can report a stuck fence.
+struct Active {
+    submission: u64,
+    lists: usize,
+    phase: &'static str,
+    list: usize,
+    fence: u64,
+    since: Instant,
+    pipelines: String,
+}
+static ACTIVE: std::sync::Mutex<Option<Active>> = std::sync::Mutex::new(None);
+
+pub(crate) struct SubmissionTrace(bool);
+impl SubmissionTrace {
+    pub(crate) fn begin(submission: u64, lists: usize) -> Self {
+        let on = enabled();
+        if on {
+            *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Active {
+                submission, lists, phase: "drain_previous", list: 0, fence: 0,
+                since: Instant::now(), pipelines: String::new(),
+            });
+        }
+        Self(on)
+    }
+    pub(crate) fn phase(&self, phase: &'static str, list: usize, fence: u64) {
+        if self.0 {
+            if let Some(a) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                a.phase = phase;
+                a.list = list;
+                a.fence = fence;
+                a.since = Instant::now();
+            }
+        }
+    }
+    pub(crate) fn pipelines(&self, make: impl FnOnce() -> String) {
+        if self.0 {
+            let names = make();
+            if let Some(a) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                a.pipelines = names;
+            }
+        }
+    }
+}
+impl Drop for SubmissionTrace {
+    fn drop(&mut self) {
+        if self.0 {
+            *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+}
+pub(crate) fn submission_state() -> String {
+    match ACTIVE.try_lock() {
+        Ok(a) => match a.as_ref() {
+            Some(a) => format!("active_submission={} active_lists={} active_phase={} active_list={} active_fence={} active_phase_ms={} active_pipelines={:?}",
+                a.submission, a.lists, a.phase, a.list, a.fence, a.since.elapsed().as_millis(), a.pipelines),
+            None => "active_submission=0 active_phase=idle".into(),
+        },
+        Err(_) => "active_phase=transition".into(),
+    }
+}
+
 pub(crate) fn enabled() -> bool {
     SESSION.get().is_some()
 }
@@ -25,7 +87,7 @@ pub fn start(data_dir: &Path) -> io::Result<()> {
     }
     let path = data_dir.join("performance_audit.log");
     let mut file = File::create(&path)?;
-    writeln!(file, "VIctory performance audit v3 | pid={} | diagnostics={}",
+    writeln!(file, "VIctory performance audit v4 | pid={} | diagnostics={}",
         std::process::id(), cfg!(feature = "diagnostics"))?;
     writeln!(file, "CPU timings can overlap; GPU submit+wait is wall time, not GPU execution.")?;
     for key in ["VICTORY_ASYNC_SUBMIT", "VICTORY_GPU_TIMING", "VICTORY_D3D12_DRED",
@@ -50,10 +112,10 @@ pub fn start(data_dir: &Path) -> io::Result<()> {
             // stop memory reporting too.
             let now = Instant::now();
             if now >= next {
-                let line = format!("[+{:.3}s] memory_sample presented={} {} {} {} {}",
+                let line = format!("[+{:.3}s] memory_sample presented={} {} {} {} {} {} {} {}",
                     started.elapsed().as_secs_f64(), crate::queue::presented(),
                     process_memory(), system_memory(), crate::memstat::atomic_report(),
-                    crate::timeline::audit_state());
+                    crate::timeline::audit_state(), crate::texpool::audit_state(), crate::resource::placed_audit(), submission_state());
                 if writeln!(file, "{line}").and_then(|()| file.flush()).is_err() {
                     tracing::warn!("performance audit memory write failed");
                     break;
