@@ -19,6 +19,8 @@
 mod audit;
 #[cfg(windows)]
 pub use audit::start as start_performance_audit;
+#[cfg(windows)]
+pub use audit::record_memory_failure;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]

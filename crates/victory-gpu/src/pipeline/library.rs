@@ -48,7 +48,11 @@ struct Library {
 // mutex that holds the library.
 unsafe impl Send for Library {}
 
-const LIBRARY_FILE: &str = "host-pipelines.bin";
+// Host description schema v2: integer-target blend normalization changed
+// actual D3D12 PSOs without changing the title-state hash. Never load
+// or overwrite the v1 library under the old name. Keep early title keys
+// and the compiler crash blacklist independent of this cache epoch.
+const LIBRARY_FILE: &str = "host-pipelines-v2.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;

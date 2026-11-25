@@ -502,6 +502,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     };
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
+        victory_gpu::record_memory_failure("physical section reservation", size as u64, &error.to_string());
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
@@ -808,10 +809,12 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         )
     };
     if view.Value as usize != base {
+        let error = std::io::Error::last_os_error();
+        victory_gpu::record_memory_failure("physical view mapping", len as u64, &error.to_string());
         tracing::warn!(
             address = format_args!("{base:#x}"),
             len,
-            error = %std::io::Error::last_os_error(),
+            %error,
             "mapping physical pages failed (not a placeholder?)"
         );
         return false;
@@ -851,6 +854,7 @@ fn commit(base: usize, len: usize) -> bool {
 /// `crashes.log`, since the title usually faults soon after on the null it
 /// gets; otherwise as a warning.
 fn commit_refused(len: usize, what: &str, error: std::io::Error) {
+    victory_gpu::record_memory_failure(what, len as u64, &error.to_string());
     if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
         let mut info = PERFORMANCE_INFORMATION {
             cb: size_of::<PERFORMANCE_INFORMATION>() as u32,

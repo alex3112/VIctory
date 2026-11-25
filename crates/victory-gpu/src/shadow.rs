@@ -1558,6 +1558,7 @@ fn new_tile() -> Option<Tile> {
             })
         };
         if let Err(error) = made {
+            crate::audit::record_memory_failure("sparse tile heap", size, &error.to_string());
             tracing::warn!(%error, "no memory for copies of title memory");
             return None;
         }
@@ -1796,6 +1797,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
     crate::host::name(&buffer, || format!("copies of title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    crate::memstat::add(if of.is_some() { &crate::memstat::SPARSE_ALIASES } else { &crate::memstat::SPARSE_ROOTS }, 1);
     tracing::info!(start = format_args!("{start:#x}"), len, alias = of.is_some(), "sparse copies of title memory");
     Some(Shadow {
         buffer,

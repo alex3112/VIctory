@@ -34,6 +34,22 @@ pub(crate) fn sub(counter: &AtomicU64, bytes: u64) {
 /// command lists alive.
 pub(crate) static BUFFERS: [[AtomicU64; 2]; 6] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 6];
 pub(crate) static LISTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static RETIRED_COUNT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SPARSE_ROOTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SPARSE_ALIASES: AtomicU64 = AtomicU64::new(0);
+
+/// Lock-free counters safe to sample even while presentation is stalled.
+#[cfg(windows)]
+pub(crate) fn atomic_report() -> String {
+    let mib = |a: &AtomicU64| a.load(Relaxed) >> 20;
+    format!("title_gpu_mib={} shadow_mib={} host_texture_mib={} host_textures={} placed_textures={} upload_mib={} readback_mib={} shared_mib={} unordered_mib={} texture_heap_mib={} tile_heap_mib={} retired_objects={} sparse_roots={} sparse_aliases={} staging_mib={} bindless_pending_submit={} bindless_pending_record={}",
+        mib(&TITLE_GPU), mib(&SHADOWS), mib(&HOST_TEXTURES), HOST_TEXTURE_COUNT.load(Relaxed),
+        PLACED_COUNT.load(Relaxed), mib(&BUFFERS[0][0]), mib(&BUFFERS[1][0]), mib(&BUFFERS[2][0]),
+        mib(&BUFFERS[3][0]), mib(&BUFFERS[4][0]), mib(&BUFFERS[5][0]),
+        RETIRED_COUNT.load(Relaxed), SPARSE_ROOTS.load(Relaxed), SPARSE_ALIASES.load(Relaxed),
+        crate::texture::staged_bytes() >> 20, crate::descriptor::host::BACKLOG[0].load(Relaxed),
+        crate::descriptor::host::BACKLOG[1].load(Relaxed))
+}
 
 /// Counts `resource` (`bytes`) as one of `kind` until it is destroyed.
 #[cfg(windows)]

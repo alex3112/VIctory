@@ -25,22 +25,48 @@ pub fn start(data_dir: &Path) -> io::Result<()> {
     }
     let path = data_dir.join("performance_audit.log");
     let mut file = File::create(&path)?;
-    writeln!(file, "VIctory performance audit v1 | pid={} | diagnostics={}",
+    writeln!(file, "VIctory performance audit v2 | pid={} | diagnostics={}",
         std::process::id(), cfg!(feature = "diagnostics"))?;
     writeln!(file, "CPU timings can overlap; GPU submit+wait is wall time, not GPU execution.")?;
     for key in ["VICTORY_ASYNC_SUBMIT", "VICTORY_GPU_TIMING", "VICTORY_D3D12_DRED",
         "VICTORY_D3D12_DEBUG", "VICTORY_D3D12_GBV", "VICTORY_D3D12_WARP",
         "VICTORY_TEXTURE_MAX", "VICTORY_TEXTURES", "VICTORY_CARD_BUFFERS",
-        "VICTORY_HOIST_CLAMPS", "VICTORY_SHADER_LOOP_LIMIT", "VICTORY_FPS"] {
+        "VICTORY_HOIST_CLAMPS", "VICTORY_SHADER_LOOP_LIMIT", "VICTORY_FPS",
+        "VICTORY_SWEEP_TILES", "VICTORY_KEEP_RETIRED", "VICTORY_STAGING_BUDGET_MB"] {
         writeln!(file, "{key}={}", std::env::var(key).unwrap_or_else(|_| "<default>".into()))?;
     }
     file.flush()?;
     let (sender, receiver) = sync_channel::<String>(32);
     let _ = std::thread::Builder::new().name("victory-audit-writer".into()).spawn(move || {
-        while let Ok(line) = receiver.recv() {
-            if writeln!(file, "{line}").and_then(|()| file.flush()).is_err() {
-                tracing::warn!("performance audit write failed");
-                break;
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::Duration;
+        let started = Instant::now();
+        let interval = Duration::from_secs(1);
+        let mut next = started;
+        loop {
+            // Independent of frame production, submission locks and GPU waits.
+            // Only query OS counters and atomics here: a stalled GPU must not
+            // stop memory reporting too.
+            let now = Instant::now();
+            if now >= next {
+                let line = format!("[+{:.3}s] memory_sample presented={} {} {} {}",
+                    started.elapsed().as_secs_f64(), crate::queue::presented(),
+                    process_memory(), system_memory(), crate::memstat::atomic_report());
+                if writeln!(file, "{line}").and_then(|()| file.flush()).is_err() {
+                    tracing::warn!("performance audit memory write failed");
+                    break;
+                }
+                next = now + interval;
+            }
+            match receiver.recv_timeout(next.saturating_duration_since(Instant::now())) {
+                Ok(line) => {
+                    if writeln!(file, "{line}").and_then(|()| file.flush()).is_err() {
+                        tracing::warn!("performance audit write failed");
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
     })?;
@@ -58,6 +84,28 @@ pub(crate) fn emit(text: String) {
             LOST.fetch_add(lost.saturating_add(1), Relaxed);
         }
     }
+}
+
+/// A failure from the HLE or GPU allocation path. No allocation policy change.
+pub fn record_memory_failure(context: &str, bytes: u64, error: &str) {
+    if enabled() {
+        emit(format!("allocation_failure context={context} bytes={bytes} error={error}"));
+    }
+}
+
+fn system_memory() -> String {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the buffer is a whole writable PERFORMANCE_INFORMATION.
+    if unsafe { K32GetPerformanceInfo(&mut info, info.cb) } == 0 {
+        return "system_memory=unavailable".into();
+    }
+    let mib = |pages: usize| pages.saturating_mul(info.PageSize) >> 20;
+    format!("system_commit_mib={} system_commit_limit_mib={} system_ram_available_mib={} system_ram_total_mib={}",
+        mib(info.CommitTotal), mib(info.CommitLimit), mib(info.PhysicalAvailable), mib(info.PhysicalTotal))
 }
 
 #[derive(Clone, Copy)]

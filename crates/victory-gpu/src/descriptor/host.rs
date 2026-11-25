@@ -225,6 +225,20 @@ const SLOT_CHUNK: usize = 512;
 const URGENT: usize = 2048;
 
 impl Bindless {
+    /// Keep the most recent occurrence of each dirty slot; repeated title
+    /// writes otherwise grow this queue without producing any extra work.
+    fn note_recent(&mut self, index: u32) {
+        self.dirty.insert(index);
+        self.recent.push(index);
+        if self.recent.len() > self.dirty.len().saturating_mul(2).saturating_add(4096) {
+            let dirty = &self.dirty;
+            let mut seen = std::collections::HashSet::new();
+            self.recent.reverse();
+            self.recent.retain(|i| dirty.contains(i) && seen.insert(*i));
+            self.recent.reverse();
+        }
+    }
+
     /// The slot-making budget, refilled for the time passed since.
     fn budget(&mut self) -> &mut [u64; 2] {
         let now = std::time::Instant::now();
@@ -1120,8 +1134,7 @@ impl HostHeap {
     fn track_bindless(&self, index: u32, entry: (u32, u32), placed: bool) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         if b.slots.insert(index, entry) != Some(entry) {
-            b.dirty.insert(index);
-            b.recent.push(index);
+            b.note_recent(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
                 bounce.active = false;
             }
@@ -1140,8 +1153,7 @@ impl HostHeap {
     fn untrack_bindless(&self, index: u32) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         if b.slots.remove(&index).is_some() {
-            b.dirty.insert(index);
-            b.recent.push(index);
+            b.note_recent(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
                 bounce.active = false;
             }
@@ -1482,6 +1494,10 @@ impl HostHeap {
         }
         over.extend(todo.map(|(i, _)| i));
         reached.extend(due);
+        // Many slots can name the same texture: upload/transition it once
+        // per preparation batch, keeping the first occurrence's order.
+        let mut seen = std::collections::HashSet::new();
+        reached.retain(|t| seen.insert(*t as usize));
         for texture in reached {
             // The texture may be evicted meanwhile: a reference keeps it.
             let Some(_held) = crate::resource::hold_placed(texture) else {
@@ -1696,10 +1712,13 @@ impl HostHeap {
                     }
                 }
             }
+            // Already selected recent slots will be generation-checked by
+            // use_slot, so don't enqueue them a second time via stale_views.
+            let urgent_set: std::collections::HashSet<u32> = urgent.iter().copied().collect();
             let check: Vec<(u32, (u32, u32))> = if viewed {
                 b.slots
                     .iter()
-                    .filter(|(i, _)| !dirty.contains(i))
+                    .filter(|(i, _)| !dirty.contains(i) && !urgent_set.contains(i))
                     .map(|(&i, &v)| (i, v))
                     .collect()
             } else {

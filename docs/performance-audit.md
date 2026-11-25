@@ -62,3 +62,23 @@ Not yet measured: actual GPU idle, per-shader approximation usage, actual
 clamp modifications, individual resource allocation/free rates, and full
 title CPU profiling. Existing VICTORY_PROFILE=<file> can sample submission
 thread stacks separately.
+
+## Memory & Stability (audit v2)
+
+Every second the audit writer now records `memory_sample`, including system RAM,
+system commit/limit, process resident/private bytes, presented frame count,
+tracked GPU allocation categories, retired object count and sparse root/alias
+counts. These samples do not depend on presenting a frame or on a GPU wait.
+Allocation failures are recorded by the HLE and key GPU allocation paths.
+Counters may overlap; sparse alias counts are not physical memory usage.
+
+Host texture creation is deduplicated per address shard; small placement probes
+are restricted to small candidate descriptions. First texture slabs are smaller,
+and read-only textures avoid a second retirement delay while keeping the final
+GPU retirement fence/frame policy. Bindless preparation coalesces repeated work;
+its existing time budget, urgent ordering and null-view safety remain in place.
+The D3D12 pipeline library uses a new filename (v2), preserving old files and
+compiler crash history. The first run rebuilds this library. No mip limit,
+shader policy, GPU timeout or experimental sparse-tile sweep default is changed.
+
+Windows validation and gameplay measurements are still required.

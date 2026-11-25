@@ -146,11 +146,13 @@ unsafe impl Send for Retired {}
 pub(crate) fn retire<T: 'static>(object: T) {
     let submission = STARTED.load(Ordering::Acquire);
     let frame = crate::queue::presented();
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back(Retired {
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    retired.push_back(Retired {
         submission,
         frame,
         object: Box::new(object),
     });
+    crate::memstat::add(&crate::memstat::RETIRED_COUNT, 1);
 }
 
 /// Drops what waited for submissions up to `finished` and is old enough
@@ -171,6 +173,7 @@ fn bury(finished: u64) {
                 r.submission <= finished && now.saturating_sub(r.frame) >= KEEP_FRAMES
             })
             .count();
+        crate::memstat::sub(&crate::memstat::RETIRED_COUNT, n as u64);
         retired.drain(..n).collect()
     };
     drop(done);

@@ -74,11 +74,17 @@ fn class(bytes: u64) -> u64 {
 fn slot(size: (u64, bool), make: impl FnOnce(u64) -> Option<Memory>) -> Option<(Slot, Memory)> {
     let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
     let of = slabs.entry(size).or_default();
-    let bytes = (size.0 * 8).clamp(1 << 20, 16 << 20).next_multiple_of(64 << 10);
     let used = of.iter().position(|s| s.memory.is_some() && !s.free.is_empty());
     let at = match used.or_else(|| of.iter().position(|s| s.memory.is_none())) {
         Some(at) => at,
         None => {
+            // A rare texture size class need not reserve eight slots before
+            // it has a second user. Grow subsequent slabs normally.
+            let bytes = if !size.1 && of.is_empty() {
+                (size.0 * 2).clamp(256 << 10, 16 << 20)
+            } else {
+                (size.0 * 8).clamp(1 << 20, 16 << 20)
+            }.next_multiple_of(64 << 10);
             let slots = (bytes / size.0) as u32;
             of.push(Slab {
                 memory: None,
@@ -90,6 +96,7 @@ fn slot(size: (u64, bool), make: impl FnOnce(u64) -> Option<Memory>) -> Option<(
     };
     let s = &mut of[at];
     if s.memory.is_none() {
+        let bytes = (u64::from(s.slots) * size.0).next_multiple_of(64 << 10);
         s.memory = Some(make(bytes)?);
     }
     let index = s.free.pop()?;
@@ -129,19 +136,30 @@ pub(crate) fn place(
         return None;
     }
     let mut desc = *desc;
-    // Small textures may lie on multiples of 4 KiB.
-    desc.Alignment = 4 << 10;
+    desc.Alignment = 0;
+    // Query the legal default first. Only a single-slice 2D texture fitting
+    // in one default allocation is a candidate for small placement. Large
+    // streamed textures must never issue the rejected 4 KiB probe.
     // SAFETY: a whole description.
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[desc]) };
-    if info.Alignment != 4 << 10 || info.SizeInBytes == u64::MAX {
-        desc.Alignment = 0;
-        // SAFETY: as above.
-        info = unsafe { device.GetResourceAllocationInfo(0, &[desc]) };
+    if info.SizeInBytes <= 64 << 10
+        && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.DepthOrArraySize == 1
+        && desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN
+    {
+        let mut small = desc;
+        small.Alignment = 4 << 10;
+        // SAFETY: a whole description; fall back to the valid default if refused.
+        let candidate = unsafe { device.GetResourceAllocationInfo(0, &[small]) };
+        if candidate.Alignment == 4 << 10 && candidate.SizeInBytes != u64::MAX {
+            desc = small;
+            info = candidate;
+        }
     }
     if info.SizeInBytes == 0 || info.SizeInBytes > LARGEST || info.Alignment > 64 << 10 {
         return None;
     }
-    let size = class(info.SizeInBytes);
+    let size = class(info.SizeInBytes).next_multiple_of(info.Alignment.max(1));
     let (slot, memory) = slot((size, false), |bytes| {
         let heap = D3D12_HEAP_DESC {
             SizeInBytes: bytes,

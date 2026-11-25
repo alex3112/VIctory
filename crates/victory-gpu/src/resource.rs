@@ -693,8 +693,11 @@ impl Memory {
         let layout = Layout::from_size_align(info.size as usize, info.alignment as usize)
             .map_err(|_| E_INVALIDARG)?;
         let attributes = resource_attributes(info, heap_kind);
-        let ptr =
-            NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
+        let ptr = NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or_else(|| {
+            #[cfg(windows)]
+            crate::audit::record_memory_failure("title resource allocator", layout.size() as u64, "null");
+            E_OUTOFMEMORY
+        })?;
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
         crate::memstat::add(&crate::memstat::TITLE_GPU, layout.size() as u64);
@@ -722,7 +725,11 @@ impl Memory {
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
         // SAFETY: the size is non-zero.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or_else(|| {
+            #[cfg(windows)]
+            crate::audit::record_memory_failure("host resource backing", layout.size() as u64, "null");
+            E_OUTOFMEMORY
+        })?;
         crate::memstat::add(&crate::memstat::TITLE_GPU, layout.size() as u64);
         Ok(Memory {
             ptr,
@@ -1327,6 +1334,7 @@ fn host_texture(
         }
     }
     if let Err(e) = made {
+        crate::audit::record_memory_failure("host texture", 0, &format!("{e}; {d:?}"));
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
     if let Some(t) = &texture {
@@ -1480,7 +1488,15 @@ impl Drop for Resource {
         }
         // A running submission may still read the host copy.
         if let Some(host) = self.host.take() {
-            crate::host::retire(host);
+            // Read-only host textures already retire their COM resource and
+            // pool slot in HostTexture::drop; lists keep their own Arc.
+            // Avoid two consecutive 32-frame retirement periods. Keep the
+            // old outer protection for writable/depth resources and twins.
+            if self.desc.flags & 7 == 0 {
+                drop(host);
+            } else {
+                crate::host::retire(host);
+            }
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
@@ -1743,6 +1759,19 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
             return Some(r as This);
         }
     }
+    // Two recording threads can miss the same lookup simultaneously.
+    // Serialize creation per address shard, not all streamed textures.
+    // The global map is not held during D3D12 allocation.
+    static CREATING: [std::sync::Mutex<()>; 64] =
+        [const { std::sync::Mutex::new(()) }; 64];
+    let shard = ((address >> 8) ^ (address >> 24)) as usize % CREATING.len();
+    let creation = CREATING[shard].lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(r, _)) = map.get(&(address, *desc)) {
+            return Some(r as This);
+        }
+    }
     let size = match texture_layout(&d) {
         Some(t) if largest > 0 && t.planes.len() == 1 => t.planes[0].layout.reach(largest),
         _ => footprint(&d).map_or(1, |info| info.size.max(1)),
@@ -1770,12 +1799,14 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
         return None;
     }
     if resource(out).host.is_none() {
+        drop(creation);
         resource_release(out);
         return None;
     }
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(r, _)) = map.get(&(address, *desc)) {
         drop(map);
+        drop(creation);
         resource_release(out);
         return Some(r as This);
     }
@@ -1886,6 +1917,7 @@ pub(crate) fn evict_placed_textures(start: u64, end: u64) {
                 evicted.push(res);
             }
         }
+        crate::memstat::PLACED_COUNT.store(map.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     EVICTED.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed);
     if !evicted.is_empty() {
