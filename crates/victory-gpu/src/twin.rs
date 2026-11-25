@@ -1,576 +1,581 @@
-//! Depth textures the title also writes through unordered access (decision
-//! 0007, "One host texture per texture memory"). The console allows both
-//! uses of one texture (Grand Theft Auto VI's shadow-map copies and its
-//! material depth, written by compute and then tested as depth); the host
-//! does not: a depth-stencil resource takes no unordered access, in any
-//! format. Such a texture gets a writable twin, a colour texture per plane
-//! (depth, stencil) that its unordered access views write, and the newer
-//! contents move between the two by copies where the use changes: within
-//! a list where it records the change (`HostList::transition`), and at
-//! submission for each list's first use, from the side the lists before it
-//! left newer. A 16-bit depth plane in the host's 24-bit one (the
-//! console's 16-bit depth with stencil) is converted on the way, so a
-//! value written as 16-bit depth compares equal to the same depth
-//! rasterised.
+//! Depth textures that shaders also write as unordered-access images.
 //!
-//! shortcut: uses the lists do not name (shaders indexing the heap
-//! themselves) move nothing; a whole twin is copied for any use of either
-//! plane, also when the next pass overwrites all of it; console 24-bit
-//! depth gets no twin. Upgrade when a frame trace shows such a use, or the
-//! copies (counted on the frame-rate line) cost.
+//! The console lets a depth texture be both: Grand Theft Auto VI's material
+//! classifier (`CS_GenerateMaterialMasks`, `CS_MaterialTilesInitial`) writes
+//! each pixel's material number (n / 65535) into the depth plane of a
+//! 16-bit depth + stencil texture and flag bits into its stencil plane; the
+//! tiled lighting then draws each material's tiles at depth n / 65535 with
+//! that texture bound for depth, so only the pixels of that material are
+//! lit. The host refuses unordered access on depth textures, so those
+//! writes were lost and only material 0 was ever lit (whole tiles without
+//! it stayed unlit squares).
+//!
+//! Such a texture gets a twin per plane the host can write: depth as
+//! `R16_UNORM` (the console's 16-bit depth), stencil as `R8_UINT`. The
+//! title's unordered-access views are made on the twins, and right after a
+//! dispatch that wrote one, a small draw copies it into the depth texture
+//! (depth through `SV_Depth`, stencil through `SV_StencilRef`).
+//! Everything else (draws, shader reads, clears) keeps using the depth
+//! texture itself.
+//!
+//! shortcut: the copy goes one way. Depth or stencil written by draws or
+//! clears is not copied back to the twins, so a dispatch writing only part
+//! of a twin after that puts back older values elsewhere. The material
+//! classifier writes every pixel first, so it does not; only the console's
+//! 16-bit depth + stencil formats (118-120) get twins for now, not the
+//! 16-bit shadow maps draws write.
+//! shortcut: mip 0 and slice 0 only.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
-
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU32, Ordering};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::s;
+use windows::core::{PCSTR, s};
 
-use crate::host::{HostList, host, transition};
+use crate::host::{Host, HostList};
 use crate::object::This;
-use crate::resource::HostTexture;
 
-/// Which side holds the newer contents.
-pub(crate) const BOTH: u8 = 0;
-pub(crate) const DEPTH: u8 = 1;
-pub(crate) const TWIN: u8 = 2;
+macro_rules! once {
+    ($($arg:tt)*) => {{
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!($($arg)*));
+    }};
+}
 
-const RENDER_TARGET: u32 = 0x4;
-const UNORDERED_ACCESS: u32 = 0x8;
-const DEPTH_WRITE: u32 = 0x10;
-const COPY_DEST: u32 = 0x400;
-const COPY_SOURCE: u32 = 0x800;
-const RESOLVE_DEST: u32 = 0x1000;
-
-/// Copies between a depth texture and its twin since the last frame-rate
-/// line (either way, within lists and at submission).
-pub(crate) static COPIES: AtomicU64 = AtomicU64::new(0);
-
+/// A depth texture's planes as textures shaders can write.
 pub(crate) struct Twin {
-    /// The colour texture of each plane the depth texture has (depth, then
-    /// stencil), shader-writable.
-    pub(crate) planes: Vec<Arc<HostTexture>>,
-    /// Which side is newer as of the lists submitted so far.
-    pub(crate) newer: AtomicU8,
-    /// Per plane and subresource: how its bytes go through `scratch`.
-    routes: Vec<Route>,
-    /// A shader-writable buffer the copies go through, in the common state
-    /// between them.
-    scratch: ID3D12Resource,
+    pub(crate) depth: ID3D12Resource,
+    pub(crate) stencil: Option<ID3D12Resource>,
+    depth_format: DXGI_FORMAT,
+    /// The depth texture's typed depth format.
+    dsv_format: DXGI_FORMAT,
+    width: u32,
+    height: u32,
 }
 
-// SAFETY: D3D12 objects are free-threaded; the rest is atomics and data.
-unsafe impl Send for Twin {}
-// SAFETY: as above.
-unsafe impl Sync for Twin {}
-
-/// One subresource of one plane.
-struct Route {
-    plane: usize,
-    /// Its index in the twin's plane texture and in the depth texture.
-    twin_sub: u32,
-    depth_sub: u32,
-    /// Its place in the scratch buffer as the twin's texture has it.
-    twin: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-    /// As the depth texture has it, where that differs: a 16-bit depth
-    /// plane the host keeps in 24 bits (32 per texel), converted.
-    depth: Option<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+/// The planes of a depth texture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Plane {
+    Depth,
+    Stencil,
 }
 
-/// A depth texture's use in one list: the side its first use needs (made
-/// newer at submission, `at_submission`) and the side the list left newer
-/// (`None`: unchanged from where it started).
-pub(crate) struct Use {
-    first: u8,
-    last: Option<u8>,
-    depth: Arc<HostTexture>,
+/// Console formats of 16-bit depth with 8-bit stencil (typed, depth view,
+/// stencil view).
+const D16_S8: std::ops::RangeInclusive<u32> = 118..=120;
+
+/// Whether a title texture of `format` and `flags` gets twins.
+/// `VICTORY_DEPTH_TWINS=0` turns them off (only the first material is lit).
+pub(crate) fn wanted(format: u32, flags: u32) -> bool {
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("VICTORY_DEPTH_TWINS").is_ok_and(|v| v == "0"))
+        && flags & (DEPTH | UNORDERED) == DEPTH | UNORDERED
+        && D16_S8.contains(&format)
 }
 
-/// The twin's plane formats for a console depth format (resource or
-/// view format): 16- or 32-bit depth, then 8-bit stencil if it has one.
-/// `None` for 24-bit depth, whose host plane takes no unordered view.
-fn plane_formats(console: u32) -> Option<&'static [u32]> {
-    const R16: u32 = 53;
-    const R32: u32 = 39;
-    const R8: u32 = 60;
-    match console {
-        53 | 55 => Some(&[R16]),
-        39..=41 => Some(&[R32]),
-        118..=120 => Some(&[R16, R8]),
-        19..=22 => Some(&[R32, R8]),
-        _ => None,
-    }
-}
-
-/// The twin of the depth texture `depth`, whose title resource has format
-/// `console`; `None` if the host makes none.
-fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
-    let host = host()?;
-    let Some(formats) = plane_formats(console) else {
-        once(console, 0, 0, "a depth texture of this format gets no writable twin: its unordered writes are dropped");
-        return None;
-    };
+/// Makes the twins of the host depth texture `texture`.
+pub(crate) fn make(texture: &ID3D12Resource) -> Option<Twin> {
+    let host = crate::host::host()?;
     // SAFETY: a live resource.
-    let dd = unsafe { depth.GetDesc() };
-    let subs = u32::from(dd.MipLevels) * u32::from(dd.DepthOrArraySize).max(1);
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
-    let mut planes = Vec::new();
-    for &f in formats {
+    let d = unsafe { texture.GetDesc() };
+    let own = d.Format.0 as u32;
+    let typed = crate::resource::DEPTH_FORMATS
+        .iter()
+        .find(|&&(typed, typeless)| typed == own || typeless == own)
+        .map(|&(typed, _)| typed)?;
+    // D24S8 and D32S8 have stencil (the console's 16-bit depth with stencil
+    // becomes D24S8 on the host).
+    let has_stencil = matches!(typed, 20 | 45);
+    let plane = |format: DXGI_FORMAT| -> Option<ID3D12Resource> {
         let desc = D3D12_RESOURCE_DESC {
-            Format: DXGI_FORMAT(f as i32),
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: d.Width,
+            Height: d.Height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
-            Alignment: 0,
-            ..dd
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
         };
-        let mut texture: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation; our out pointer.
-        let made = unsafe {
-            host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture)
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
         };
-        if let Err(e) = made {
-            tracing::warn!(error = %e, ?desc, "no writable twin for a depth texture");
-            return None;
-        }
-        let texture = texture?;
-        crate::host::name(&texture, || format!("depth twin {}x{} f{f}", dd.Width, dd.Height));
-        planes.push(Arc::new(HostTexture::new(texture, 0, Vec::new())));
-    }
-    // The depth texture's footprints, every plane, and the twin's.
-    let n = subs * planes.len() as u32;
-    let mut df = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize];
-    let mut drows = vec![0u32; n as usize];
-    // SAFETY: outputs sized for `n` subresources.
-    unsafe { host.device.GetCopyableFootprints(&dd, 0, n, 0, Some(df.as_mut_ptr()), Some(drows.as_mut_ptr()), None, None) };
-    let mut routes = Vec::new();
-    let mut at = 0u64;
-    let mut place = |mut f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT, rows: u32| {
-        f.Offset = at;
-        let bytes = u64::from(f.Footprint.RowPitch) * u64::from(rows) * u64::from(f.Footprint.Depth);
-        at = (at + bytes).next_multiple_of(512);
-        f
-    };
-    for (p, plane) in planes.iter().enumerate() {
-        // SAFETY: a live resource.
-        let td = unsafe { plane.texture.GetDesc() };
-        let mut tf = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs as usize];
-        let mut trows = vec![0u32; subs as usize];
-        // SAFETY: outputs sized for `subs` subresources.
-        unsafe { host.device.GetCopyableFootprints(&td, 0, subs, 0, Some(tf.as_mut_ptr()), Some(trows.as_mut_ptr()), None, None) };
-        for s in 0..subs {
-            let d = (p as u32 * subs + s) as usize;
-            let same = df[d].Footprint.Format == td.Format;
-            // The same bytes: both sides copy through the depth texture's
-            // footprint; else each its own, converted between.
-            let route = if same {
-                Route { plane: p, twin_sub: s, depth_sub: d as u32, twin: place(df[d], drows[d]), depth: None }
-            } else {
-                let twin = place(tf[s as usize], trows[s as usize]);
-                Route { plane: p, twin_sub: s, depth_sub: d as u32, twin, depth: Some(place(df[d], drows[d])) }
-            };
-            if route.depth.is_some() && (td.Format != DXGI_FORMAT_R16_TYPELESS || df[d].Footprint.Format != DXGI_FORMAT_R32_TYPELESS) {
-                once(console, td.Format.0 as u32, df[d].Footprint.Format.0 as u32, "a depth twin plane with no conversion to the host's: not made");
-                return None;
-            }
-            routes.push(route);
-        }
-    }
-    let scratch = scratch_buffer(at)?;
-    crate::host::name(&scratch, || format!("depth twin copies {at:#x}"));
-    tracing::debug!(console, width = dd.Width, height = dd.Height, planes = planes.len(), "a writable twin for a depth texture");
-    Some(Twin { planes, newer: AtomicU8::new(DEPTH), routes, scratch })
-}
-
-/// A default-heap buffer of `size` bytes shaders may write, in the common
-/// state.
-fn scratch_buffer(size: u64) -> Option<ID3D12Resource> {
-    let host = host()?;
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: size.max(256),
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        ..Default::default()
-    };
-    let mut buffer: Option<ID3D12Resource> = None;
-    // SAFETY: plain creation.
-    let made = unsafe {
-        host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
-    };
-    made.ok().and(buffer)
-}
-
-/// Logs once per (console format, view format, plane) what happened.
-fn once(console: u32, view: u32, plane: u32, what: &str) {
-    static SEEN: std::sync::Mutex<Vec<(u32, u32, u32, String)>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let key = (console, view, plane, what.to_owned());
-    if seen.len() < 64 && !seen.contains(&key) {
-        tracing::info!(console, view, plane, "{what}");
-        seen.push(key);
-    }
-}
-
-/// An unordered access view at `at` of `resource`, a depth texture whose
-/// host copy is `copy`, made on its twin's plane the title's view names
-/// (`words`: the view description), in a format of that plane's family
-/// (the title's own if it is one, else the plane's integer or normalised
-/// one, as the title's format is). The twin's plane texture, which the
-/// slot then views.
-pub(crate) fn uav(
-    resource: This,
-    copy: &Arc<HostTexture>,
-    words: Option<&[u32; 10]>,
-    at: D3D12_CPU_DESCRIPTOR_HANDLE,
-) -> Option<ID3D12Resource> {
-    let console = crate::resource::title_format(resource)?;
-    let twin = copy.twin.get_or_init(|| make(console, &copy.texture)).as_ref()?;
-    let mut words = *words?;
-    const TEXTURE_2D: u32 = 4;
-    const TEXTURE_2D_ARRAY: u32 = 5;
-    // The plane: last of the 2D view's fields (mip, plane; mip, first
-    // slice, slices, plane).
-    let plane_word = match words[1] {
-        TEXTURE_2D => 3,
-        TEXTURE_2D_ARRAY => 5,
-        other => {
-            once(console, words[0], other, "an unordered view of a depth texture of this dimension: not made");
-            return None;
-        }
-    };
-    let plane = words[plane_word] as usize;
-    let Some(texture) = twin.planes.get(plane) else {
-        once(console, words[0], plane as u32, "an unordered view of a depth plane the twin does not have: not made");
-        return None;
-    };
-    // SAFETY: a live resource.
-    let own = unsafe { texture.texture.GetDesc() }.Format.0 as u32;
-    let view = crate::resource::pc_format(words[0]);
-    let format = if crate::resource::family(view) == own {
-        view
-    } else {
-        // R16_TYPELESS: unorm or uint; R32_TYPELESS: float or uint; R8: uint.
-        match (own, integer(view)) {
-            (53, false) => 56,
-            (53, true) => 57,
-            (39, false) => 41,
-            (39, true) => 42,
-            _ => 62,
-        }
-    };
-    once(console, words[0], plane as u32, "an unordered view of a depth texture, made on its writable twin");
-    words[0] = format;
-    words[plane_word] = 0;
-    // SAFETY: 40 bytes in the host's layout.
-    let desc = unsafe { std::ptr::from_ref(&words).cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>().read_unaligned() };
-    // SAFETY: a live texture and a slot of our heap.
-    unsafe { host()?.device.CreateUnorderedAccessView(&texture.texture, None, Some(&desc), at) };
-    Some(texture.texture.clone())
-}
-
-/// Whether a format holds integers (`_UINT`, `_SINT`).
-fn integer(format: u32) -> bool {
-    matches!(format, 3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64)
-}
-
-/// Before a use in `list` of the depth texture `depth` (with `twin`) in
-/// host state `wanted`: the side the use needs is brought up to date (a
-/// copy recorded now, or by the list's prelude for its first use). For
-/// unordered access the twin's planes are moved there and true returned:
-/// the depth texture itself is not used.
-pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, wanted: u32) -> bool {
-    let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
-    let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
-    if let Some(to_depth) = list.twin_use(depth, side, writes)
-        && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
-    {
-        list.need_rebind();
-    }
-    if side == DEPTH {
-        return false;
-    }
-    let barriers: Vec<_> = twin.planes.iter().filter_map(|p| list.move_texture(p, UNORDERED_ACCESS)).collect();
-    if !barriers.is_empty() {
-        // SAFETY: an open list and live textures.
-        unsafe { list.list.ResourceBarrier(&barriers) };
-    }
-    true
-}
-
-impl Use {
-    pub(crate) fn new(depth: &Arc<HostTexture>, side: u8, writes: bool) -> Self {
-        Use { first: side, last: writes.then_some(side), depth: depth.clone() }
-    }
-
-    /// A later use in the list needing `side`: whether a copy must be
-    /// recorded first (true: into the depth texture).
-    pub(crate) fn again(&mut self, side: u8, writes: bool) -> Option<bool> {
-        again(self.first, &mut self.last, side, writes)
-    }
-}
-
-/// [`Use::again`] on its first side and the side it left newer.
-fn again(first: u8, last: &mut Option<u8>, side: u8, writes: bool) -> Option<bool> {
-    // Unchanged since the list's start: only the first use's side is
-    // known to be current there.
-    let current = match *last {
-        None => first == side,
-        Some(newer) => newer == BOTH || newer == side,
-    };
-    let copy = (!current).then_some(side == DEPTH);
-    if copy.is_some() {
-        *last = Some(BOTH);
-    }
-    if writes {
-        *last = Some(side);
-    }
-    copy
-}
-
-/// Where a list's uses leave a twin's newer side, from `newer` before it:
-/// the copy its prelude makes first (true: into the depth texture), and the
-/// newer side after the list.
-fn submitted(first: u8, last: Option<u8>, newer: u8) -> (Option<bool>, u8) {
-    let copy = match (first, newer) {
-        (DEPTH, TWIN) => Some(true),
-        (TWIN, DEPTH) => Some(false),
-        _ => None,
-    };
-    let start = if copy.is_some() { BOTH } else { newer };
-    (copy, last.unwrap_or(start))
-}
-
-/// At submission, for a list's twin uses in order: the copies its prelude
-/// records first (the depth texture and whether into it), the twins'
-/// newer sides moved on to where the list leaves them.
-pub(crate) fn at_submission<'a>(uses: impl Iterator<Item = &'a Use>) -> Vec<(Arc<HostTexture>, bool)> {
-    let mut copies = Vec::new();
-    for u in uses {
-        let Some(Some(twin)) = u.depth.twin.get() else { continue };
-        let (to_depth, after) = submitted(u.first, u.last, twin.newer.load(Relaxed));
-        twin.newer.store(after, Relaxed);
-        if let Some(to_depth) = to_depth {
-            copies.push((u.depth.clone(), to_depth));
-        }
-    }
-    copies
-}
-
-/// Moves a texture to a state for a copy: the barrier, if any.
-pub(crate) type Mover<'a> = dyn FnMut(&Arc<HostTexture>, u32) -> Option<D3D12_RESOURCE_BARRIER> + 'a;
-
-impl Twin {
-    /// Records into `l` the copy of the newer side into the other: from
-    /// the twin into `depth` (`to_depth`) or back. `mv` moves textures to
-    /// the copy states (tracked by the list, or from their real states in
-    /// a prelude). True if it ran our conversion, which replaces the
-    /// list's compute root signature and pipeline.
-    pub(crate) fn copy(&self, l: &ID3D12GraphicsCommandList, depth: &Arc<HostTexture>, to_depth: bool, mv: &mut Mover) -> bool {
-        let (src, dst) = if to_depth { (COPY_SOURCE, COPY_DEST) } else { (COPY_DEST, COPY_SOURCE) };
-        let mut barriers: Vec<_> = self.planes.iter().filter_map(|p| mv(p, src)).collect();
-        barriers.extend(mv(depth, dst));
-        let at = |r: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: a borrowed pointer the copy does not release.
-            pResource: unsafe { std::mem::transmute_copy(r) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: valid descriptions; the out pointer is ours.
+        let result = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                None,
+                &mut made,
+            )
         };
-        let placed = |f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&self.scratch) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
-        };
-        let converts = self.routes.iter().any(|r| r.depth.is_some());
-        let state = |from, to| transition(&self.scratch, D3D12_RESOURCE_STATES(from), D3D12_RESOURCE_STATES(to));
-        let mut converted = false;
-        // SAFETY: an open list; live resources in the states named (the
-        // scratch buffer starts common: its first copy promotes it).
-        unsafe {
-            if !barriers.is_empty() {
-                l.ResourceBarrier(&barriers);
-            }
-            for r in &self.routes {
-                let plane = &self.planes[r.plane].texture;
-                if to_depth {
-                    l.CopyTextureRegion(&placed(r.twin), 0, 0, 0, &at(plane, r.twin_sub), None);
-                } else {
-                    l.CopyTextureRegion(&placed(r.depth.unwrap_or(r.twin)), 0, 0, 0, &at(&depth.texture, r.depth_sub), None);
-                }
-            }
-            if converts && let Some(c) = converter() {
-                l.ResourceBarrier(&[state(COPY_DEST as i32, UNORDERED_ACCESS as i32)]);
-                l.SetComputeRootSignature(&c.root);
-                l.SetPipelineState(&c.pso);
-                l.SetComputeRootUnorderedAccessView(1, self.scratch.GetGPUVirtualAddress());
-                for r in &self.routes {
-                    let Some(d) = r.depth else { continue };
-                    let (t, d) = (r.twin.Footprint, d);
-                    let constants = [t.Width, t.Height, t.RowPitch, r.twin.Offset as u32, d.Footprint.RowPitch, d.Offset as u32, u32::from(to_depth), 0];
-                    l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
-                    l.Dispatch(t.Width.div_ceil(2).div_ceil(64), t.Height, 1);
-                }
-                l.ResourceBarrier(&[uav_barrier(), state(UNORDERED_ACCESS as i32, COPY_SOURCE as i32)]);
-                converted = true;
-            } else {
-                l.ResourceBarrier(&[state(COPY_DEST as i32, COPY_SOURCE as i32)]);
-            }
-            for r in &self.routes {
-                let plane = &self.planes[r.plane].texture;
-                if to_depth {
-                    l.CopyTextureRegion(&at(&depth.texture, r.depth_sub), 0, 0, 0, &placed(r.depth.unwrap_or(r.twin)), None);
-                } else {
-                    l.CopyTextureRegion(&at(plane, r.twin_sub), 0, 0, 0, &placed(r.twin), None);
-                }
-            }
-            l.ResourceBarrier(&[state(COPY_SOURCE as i32, 0)]);
+        if let Err(e) = result {
+            tracing::warn!(error = %e, ?format, "depth twin not made");
         }
-        COPIES.fetch_add(1, Relaxed);
-        converted
-    }
-}
-
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
-    D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+        made
+    };
+    let depth_format = DXGI_FORMAT_R16_UNORM;
+    let twin = Twin {
+        depth: plane(depth_format)?,
+        stencil: if has_stencil {
+            plane(DXGI_FORMAT_R8_UINT)
+        } else {
+            None
         },
+        depth_format,
+        dsv_format: DXGI_FORMAT(typed as i32),
+        width: d.Width as u32,
+        height: d.Height,
+    };
+    tracing::info!(
+        width = twin.width,
+        height = twin.height,
+        dsv = typed,
+        stencil = twin.stencil.is_some(),
+        "depth texture written as an image: twins made"
+    );
+    Some(twin)
+}
+
+/// The plane a title unordered-access view `words` (host layout, title
+/// format) names.
+pub(crate) fn plane_of(words: Option<&[u32; 10]>) -> Plane {
+    let Some(w) = words else {
+        return Plane::Depth;
+    };
+    const TEXTURE2D: u32 = 4;
+    let format = crate::resource::pc_format(w[0]);
+    // Stencil views: X24_TYPELESS_G8_UINT, X32_TYPELESS_G8X24_UINT,
+    // R8_UINT, or plane 1 of a two-dimensional view.
+    if matches!(format, 47 | 22 | 62) || (w[1] == TEXTURE2D && w[3] == 1) {
+        Plane::Stencil
+    } else {
+        Plane::Depth
     }
 }
 
-/// 16-bit depth (unorm, two per dword) to the host's 24-bit depth plane (in
-/// the low 24 bits of 32) and back, in the scratch buffer: `u * (2^24 - 1)
-/// / 65535` rounded, exactly, and back to the 16-bit value whose 24-bit one
-/// is nearest.
+/// Makes the title's unordered-access view `words` of a depth texture with
+/// twins at `at`, on the twin of its plane; that twin.
+pub(crate) fn view(twin: &Twin, words: Option<&[u32; 10]>, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    let plane = plane_of(words);
+    let (texture, format) = match plane {
+        Plane::Depth => (&twin.depth, twin.depth_format),
+        Plane::Stencil => (twin.stencil.as_ref()?, DXGI_FORMAT_R8_UINT),
+    };
+    if let Some(w) = words
+        && (w[1] != 4 || w[2] != 0)
+    {
+        once!(
+            dimension = w[1],
+            mip = w[2],
+            "a depth texture written as an image other than mip 0 of a 2D view: taken as mip 0"
+        );
+    }
+    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_UAV {
+                MipSlice: 0,
+                PlaneSlice: 0,
+            },
+        },
+    };
+    let host = crate::host::host()?;
+    // SAFETY: a live texture that allows unordered access; a slot of the
+    // caller's heap.
+    unsafe {
+        host.device
+            .CreateUnorderedAccessView(texture, None::<&ID3D12Resource>, Some(&desc), at)
+    };
+    Some(texture.clone())
+}
+
+thread_local! {
+    /// Twins the dispatch being recorded writes: title resource, plane.
+    static WRITTEN: RefCell<Vec<(usize, Plane)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A dispatch is about to bind its views.
+pub(crate) fn begin() {
+    WRITTEN.with(|w| {
+        let mut w = w.borrow_mut();
+        if !w.is_empty() {
+            once!("a draw wrote a depth texture as an image: not copied to it");
+            w.clear();
+        }
+    });
+}
+
+/// The dispatch being bound writes the plane of `resource` that `words`
+/// names (an unordered-access view of a texture with twins).
+pub(crate) fn note(resource: This, words: Option<&[u32; 10]>) {
+    let entry = (resource as usize, plane_of(words));
+    WRITTEN.with(|w| {
+        let mut w = w.borrow_mut();
+        if !w.contains(&entry) {
+            w.push(entry);
+        }
+    });
+}
+
+/// After a dispatch: copies the twins it wrote into their depth textures.
+/// True if anything was recorded (the list's pipeline, root signatures,
+/// heaps, targets, viewports and scissors then need setting again).
+pub(crate) fn resolve(list: &HostList) -> bool {
+    let written = WRITTEN.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    let mut recorded = false;
+    let mut done: Vec<usize> = Vec::new();
+    for &(resource, _) in &written {
+        if done.contains(&resource) {
+            continue;
+        }
+        done.push(resource);
+        let depth = written.contains(&(resource, Plane::Depth));
+        let stencil = written.contains(&(resource, Plane::Stencil));
+        recorded |= copy(list, resource as This, depth, stencil);
+    }
+    recorded
+}
+
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), UAV(u0)"
-cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint unused; };
-RWByteAddressBuffer buf : register(u0);
-uint d24(uint u) { return u * 256 + (u * 255 + 32767) / 65535; }
-uint u16(uint d) {
-    d &= 0xffffff;
-    uint u = min(d >> 8, 65535);
-    uint best = u;
-    int err = abs((int)d24(u) - (int)d);
-    if (u > 0 && abs((int)d24(u - 1) - (int)d) < err) { best = u - 1; err = abs((int)d24(u - 1) - (int)d); }
-    if (u < 65535 && abs((int)d24(u + 1) - (int)d) < err) { best = u + 1; }
-    return best;
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL)"
+Texture2D<float> depth_ : register(t0);
+Texture2D<uint> stencil_ : register(t1);
+[RootSignature(RS)]
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+struct Both { float depth : SV_Depth; uint stencil : SV_StencilRef; };
+[RootSignature(RS)]
+Both both(float4 at : SV_Position) {
+    Both o;
+    o.depth = depth_.Load(int3(at.xy, 0));
+    o.stencil = stencil_.Load(int3(at.xy, 0));
+    return o;
 }
 [RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    uint x = id.x * 2;
-    uint y = id.y;
-    if (x >= width || y >= height) return;
-    uint a = at16 + y * pitch16 + x * 2;
-    uint b = at32 + y * pitch32 + x * 4;
-    bool two = x + 1 < width;
-    if (toDepth != 0) {
-        uint pair = buf.Load(a);
-        buf.Store(b, d24(pair & 0xffff));
-        if (two) buf.Store(b + 4, d24(pair >> 16));
-    } else {
-        uint lo = u16(buf.Load(b));
-        uint hi = two ? u16(buf.Load(b + 4)) : 0;
-        buf.Store(a, lo | hi << 16);
-    }
+float depth_only(float4 at : SV_Position) : SV_Depth {
+    return depth_.Load(int3(at.xy, 0));
+}
+[RootSignature(RS)]
+uint stencil_only(float4 at : SV_Position) : SV_StencilRef {
+    return stencil_.Load(int3(at.xy, 0));
 }
 "#;
 
-struct Converter {
+/// Descriptor pairs, used in turn: more than the copies of every list in
+/// flight.
+const SLOTS: u32 = 4096;
+
+/// Depth format, depth written, stencil written.
+type PipelineKey = (i32, bool, bool);
+
+struct Copier {
     root: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
+    vs: ID3DBlob,
+    both: ID3DBlob,
+    depth_only: ID3DBlob,
+    stencil_only: ID3DBlob,
+    /// Whether the host takes stencil values from pixel shaders.
+    stencil_ref: bool,
+    /// By depth format, depth written, stencil written.
+    pipelines: std::sync::Mutex<Vec<(PipelineKey, ID3D12PipelineState)>>,
+    views: ID3D12DescriptorHeap,
+    step: u32,
+    next: AtomicU32,
 }
-
-// SAFETY: D3D12 objects are free-threaded.
-unsafe impl Send for Converter {}
+// SAFETY: D3D12 objects are free-threaded; blobs are only read.
+unsafe impl Send for Copier {}
 // SAFETY: as above.
-unsafe impl Sync for Converter {}
+unsafe impl Sync for Copier {}
 
-fn converter() -> Option<&'static Converter> {
-    static MADE: std::sync::OnceLock<Option<Converter>> = std::sync::OnceLock::new();
-    MADE.get_or_init(|| match compile() {
-        Ok(c) => Some(c),
-        Err(e) => {
-            tracing::warn!(error = %e, "no depth conversion: 16-bit depth written through unordered views does not reach the depth texture");
-            None
-        }
-    })
-    .as_ref()
-}
-
-fn compile() -> windows::core::Result<Converter> {
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("depth"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, Some(&mut errors))
+    // SAFETY: the source and names live through the call; the out pointers
+    // are ours.
+    let result = unsafe {
+        D3DCompile(
+            SOURCE.as_ptr().cast(),
+            SOURCE.len(),
+            s!("twin"),
+            None,
+            None,
+            entry,
+            target,
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
     };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe { std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize()) };
-            tracing::warn!("depth conversion: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
+    if let (Err(e), Some(errors)) = (&result, &errors) {
+        // SAFETY: the blob's own bytes.
+        let text = unsafe {
+            std::slice::from_raw_parts(
+                errors.GetBufferPointer().cast::<u8>(),
+                errors.GetBufferSize(),
+            )
+        };
+        tracing::warn!(error = %e, text = %String::from_utf8_lossy(text), "depth twin copy not compiled");
     }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
-    unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+    result?;
+    code.ok_or_else(windows::core::Error::empty)
+}
+
+fn bytes(b: &ID3DBlob) -> &[u8] {
+    // SAFETY: the blob's own bytes, alive as long as it.
+    unsafe { std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize()) }
+}
+
+fn make_copier(host: &Host) -> windows::core::Result<Copier> {
+    let vs = compile(s!("vs"), s!("vs_5_1"))?;
+    let both = compile(s!("both"), s!("ps_5_1"))?;
+    let depth_only = compile(s!("depth_only"), s!("ps_5_1"))?;
+    let stencil_only = compile(s!("stencil_only"), s!("ps_5_1"))?;
+    let device = &host.device;
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    // SAFETY: the structure the feature names, ours.
+    let stencil_ref = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS,
+            std::ptr::from_mut(&mut options).cast(),
+            std::mem::size_of_val(&options) as u32,
+        )
+    }
+    .is_ok()
+        && options.PSSpecifiedStencilRefSupported.as_bool();
+    if !stencil_ref {
+        tracing::warn!("the host takes no stencil from pixel shaders: depth twins copy depth only");
+    }
+    // SAFETY: a root signature the compiler embedded.
+    let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, bytes(&vs))? };
+    // SAFETY: a plain description.
+    let views = unsafe {
+        device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: 2 * SLOTS,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })?
+    };
+    Ok(Copier {
+        root,
+        vs,
+        both,
+        depth_only,
+        stencil_only,
+        stencil_ref,
+        pipelines: std::sync::Mutex::new(Vec::new()),
+        views,
+        // SAFETY: a plain query.
+        step: unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) },
+        next: AtomicU32::new(0),
+    })
+}
+
+impl Copier {
+    fn pipeline(&self, host: &Host, format: DXGI_FORMAT, depth: bool, stencil: bool) -> Option<ID3D12PipelineState> {
+        let key = (format.0, depth, stencil);
+        let mut made = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, p)) = made.iter().find(|(k, _)| *k == key) {
+            return Some(p.clone());
+        }
+        let ps = match (depth, stencil) {
+            (true, true) => &self.both,
+            (true, false) => &self.depth_only,
+            (false, true) => &self.stencil_only,
+            (false, false) => return None,
+        };
+        let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
+            // SAFETY: the blob lives as long as the copier.
+            pShaderBytecode: unsafe { b.GetBufferPointer() },
+            // SAFETY: as above.
+            BytecodeLength: unsafe { b.GetBufferSize() },
+        };
+        let face = D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: D3D12_STENCIL_OP_REPLACE,
+            StencilDepthFailOp: D3D12_STENCIL_OP_REPLACE,
+            StencilPassOp: D3D12_STENCIL_OP_REPLACE,
+            StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+        };
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: borrowed for the call; the copier holds the root.
+            pRootSignature: unsafe { std::mem::transmute_copy(&self.root) },
+            VS: code(&self.vs),
+            PS: code(ps),
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: false.into(),
+                ..Default::default()
+            },
+            DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                // Depth tests also gate depth writes: always pass.
+                DepthEnable: true.into(),
+                DepthWriteMask: if depth {
+                    D3D12_DEPTH_WRITE_MASK_ALL
+                } else {
+                    D3D12_DEPTH_WRITE_MASK_ZERO
+                },
+                DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                StencilEnable: stencil.into(),
+                StencilReadMask: 0xff,
+                StencilWriteMask: 0xff,
+                FrontFace: face,
+                BackFace: face,
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 0,
+            DSVFormat: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             ..Default::default()
-        })?;
-        Ok(Converter { root, pso })
+        };
+        // SAFETY: a complete description with live shaders and root.
+        match unsafe { host.device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) } {
+            Ok(p) => {
+                made.push((key, p.clone()));
+                Some(p)
+            }
+            Err(e) => {
+                once!(error = %e, ?format, depth, stencil, "depth twin copy pipeline refused");
+                None
+            }
+        }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn copier(host: &Host) -> Option<&'static Copier> {
+    static COPIER: std::sync::OnceLock<Option<Copier>> = std::sync::OnceLock::new();
+    COPIER
+        .get_or_init(|| {
+            make_copier(host)
+                .inspect_err(|e| tracing::warn!(error = %e, "depth twins cannot be copied"))
+                .ok()
+        })
+        .as_ref()
+}
 
-    /// The material-depth frame of Grand Theft Auto VI: written through
-    /// unordered views, read as a shader resource in the same list, written
-    /// again; read in the next list; tested as depth in a later one; the
-    /// next frame writes it through unordered views again.
-    #[test]
-    fn copies_follow_the_side_each_use_needs() {
-        // List 1: unordered write first (the prelude copies the depth side
-        // over, newer since the last frame), a read (copy back now), a
-        // write again.
-        let mut last = Some(TWIN);
-        assert_eq!(again(TWIN, &mut last, DEPTH, false), Some(true));
-        assert_eq!(last, Some(BOTH));
-        assert_eq!(again(TWIN, &mut last, TWIN, true), None);
-        assert_eq!(submitted(TWIN, last, DEPTH), (Some(false), TWIN));
-        // List 2 only reads: its prelude copies into the depth texture.
-        assert_eq!(submitted(DEPTH, None, TWIN), (Some(true), BOTH));
-        // List 3 renders to it: nothing to copy, the depth side is newer.
-        assert_eq!(submitted(DEPTH, Some(DEPTH), BOTH), (None, DEPTH));
-        // A list that starts reading the depth side, unchanged since, does
-        // not know the twin is current: a use of the twin copies.
-        let mut last = None;
-        assert_eq!(again(DEPTH, &mut last, DEPTH, false), None);
-        assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
-        assert_eq!(last, Some(TWIN));
+/// Records the copy of `resource`'s twins (the planes asked) into it.
+fn copy(list: &HostList, resource: This, depth: bool, stencil: bool) -> bool {
+    let (Some(host), Some(texture)) = (crate::host::host(), crate::resource::host_resource(resource)) else {
+        return false;
+    };
+    let Some(twin) = crate::resource::depth_twin(resource) else {
+        return false;
+    };
+    let Some(c) = copier(host) else {
+        return false;
+    };
+    let stencil = stencil && c.stencil_ref && twin.stencil.is_some();
+    let Some(pso) = c.pipeline(host, twin.dsv_format, depth, stencil) else {
+        return false;
+    };
+    let l = &list.list;
+    const DEPTH_WRITE: u32 = 0x10;
+    crate::list::ensure_state(list, resource, DEPTH_WRITE);
+    let planes: Vec<&ID3D12Resource> = std::iter::once(&twin.depth).chain(twin.stencil.as_ref()).collect();
+    let barriers = |before, after| -> Vec<D3D12_RESOURCE_BARRIER> {
+        planes
+            .iter()
+            .map(|t| crate::host::transition(t, before, after))
+            .collect()
+    };
+    let first = 2 * (c.next.fetch_add(1, Ordering::Relaxed) % SLOTS);
+    // SAFETY: an open list; live textures; the views are made in slots no
+    // list in flight reads.
+    unsafe {
+        let cpu = c.views.GetCPUDescriptorHandleForHeapStart();
+        let gpu = c.views.GetGPUDescriptorHandleForHeapStart();
+        for (i, (plane, format)) in [
+            (Some(&twin.depth), twin.depth_format),
+            (twin.stencil.as_ref(), DXGI_FORMAT_R8_UINT),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: cpu.ptr + (first as usize + i) * c.step as usize,
+            };
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MipLevels: 1,
+                        ..Default::default()
+                    },
+                },
+            };
+            host.device.CreateShaderResourceView(plane, Some(&desc), at);
+        }
+        l.ResourceBarrier(&barriers(
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ));
+        let dsv_desc = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: twin.dsv_format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_DSV { MipSlice: 0 },
+            },
+        };
+        let dsv = host.dsv(texture, Some(&dsv_desc));
+        l.OMSetRenderTargets(0, None, false, Some(&dsv));
+        l.SetDescriptorHeaps(&[Some(c.views.clone())]);
+        l.SetGraphicsRootSignature(&c.root);
+        l.SetPipelineState(&pso);
+        l.SetGraphicsRootDescriptorTable(
+            0,
+            D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: gpu.ptr + u64::from(first) * u64::from(c.step),
+            },
+        );
+        l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        l.RSSetViewports(&[D3D12_VIEWPORT {
+            Width: twin.width as f32,
+            Height: twin.height as f32,
+            MaxDepth: 1.0,
+            ..Default::default()
+        }]);
+        l.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+            left: 0,
+            top: 0,
+            right: twin.width as i32,
+            bottom: twin.height as i32,
+        }]);
+        l.DrawInstanced(3, 1, 0, 0);
+        l.ResourceBarrier(&barriers(
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        ));
     }
+    list.keep(&c.views);
+    list.keep(&pso);
+    list.keep(&twin.depth);
+    if let Some(s) = &twin.stencil {
+        list.keep(s);
+    }
+    true
 }

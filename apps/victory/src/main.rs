@@ -58,19 +58,15 @@ enum Command {
         list: bool,
     },
     /// Find shader containers in files or directories (also inside engine
-    /// archives, if uncompressed) and report their layout. Shader packs
-    /// among the paths are listed last, their stages named from the
-    /// containers found.
+    /// archives, if uncompressed) and report their layout.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found (and per pack pipeline).
+        /// Print one line per container found.
         #[arg(long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
-        /// Instead list the effects of shader databases: technique, pass,
-        /// shaders (name, container hash, engine hash) and pass state.
         #[arg(long)]
         effects: bool,
     },
@@ -82,23 +78,23 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader. With
-        /// `--cache`: then make every pipeline of the title's shader pack
-        /// into the host pipeline library `run` reads (on this GPU and
-        /// driver; a second time only what is not there yet).
+        /// Also create a host D3D12 pipeline for each emitted shader
+        /// (translated for this host's wave sizes unless --host-lanes says).
         #[arg(long)]
         pipelines: bool,
+        /// Translate for a host whose waves are MIN-MAX lanes (32-32 for
+        /// NVIDIA, 32-64 for AMD RDNA): shaders that need another wave size
+        /// are listed as failures. Default: any wave size.
+        #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
+        host_lanes: Option<(u32, u32)>,
+        #[arg(long, conflicts_with_all = ["validate", "list"])]
+        cache: bool,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
-        /// Only translate into the shader cache `run` reads (the warm-up):
-        /// every container found, once, nothing else checked or listed
-        /// (with `--pipelines`, then the shader pack's pipelines).
-        #[arg(long, conflicts_with_all = ["validate", "list"])]
-        cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -164,19 +160,17 @@ fn main() -> Result<()> {
         } => shader::run(paths, verbose || disasm, disasm, effects),
         Command::Translate {
             paths,
-            jobs,
-            pipelines,
-            cache: true,
-            ..
-        } => translate::warm(paths, jobs, pipelines),
-        Command::Translate {
-            paths,
             validate,
             pipelines,
             list,
             jobs,
-            cache: false,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+            host_lanes,
+            cache,
+        } => if cache {
+            translate::warm(paths, jobs, pipelines, host_lanes)
+        } else {
+            translate::run(paths, validate, pipelines, list, jobs, host_lanes)
+        },
         Command::Run {
             exe,
             unimplemented,
@@ -184,16 +178,28 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
-            if code != 0 {
-                // Preserve all 32 bits of the Windows process status.
-                std::process::exit(code as i32);
-            }
-            Ok(())
-        }
+        } => run::run(&exe, unimplemented, strict, execute, console).map(|code| {
+            if code != 0 { std::process::exit(code as i32); }
+        }),
         Command::Config => show_config(),
     }
+}
+
+/// `MIN-MAX` lanes per wave, or one size `N`.
+fn parse_lanes(s: &str) -> Result<(u32, u32), String> {
+    let (a, b) = s.split_once('-').unwrap_or((s, s));
+    let n = |x: &str| {
+        x.trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| n.is_power_of_two() && (4..=128).contains(n))
+            .ok_or_else(|| format!("{x:?} is not a wave size (4 to 128, a power of two)"))
+    };
+    let (a, b) = (n(a)?, n(b)?);
+    if a > b {
+        return Err(format!("{a} is more than {b}"));
+    }
+    Ok((a, b))
 }
 
 fn show_config() -> Result<()> {
@@ -212,7 +218,6 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
-    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

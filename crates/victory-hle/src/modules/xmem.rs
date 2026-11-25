@@ -441,7 +441,18 @@ fn shown_at(pages: &[usize]) -> Vec<usize> {
 /// view showing them (DirectStorage's page destinations).
 fn report_written(shown: &[usize]) {
     for &page in shown {
-        drop(victory_gpu::kernel_will_write(page, PAGE));
+        victory_gpu::kernel_will_write(page, PAGE);
+    }
+}
+
+/// Keep the fork's streaming notifications with upstream's physical mapping.
+pub(crate) fn physical_written(pages: &[usize], offset: usize, len: usize) {
+    if len == 0 { return; }
+    let first = offset / PAGE;
+    let last = offset.saturating_add(len).div_ceil(PAGE).min(pages.len());
+    if first >= last { return; }
+    for page in shown_at(&pages[first..last]) {
+        victory_gpu::title_memory_written(page, PAGE);
     }
 }
 

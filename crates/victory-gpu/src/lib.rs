@@ -12,17 +12,18 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees, `external` host
-//! libraries recording into title lists. Planned:
+//! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
-#[cfg(windows)]
-mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod card;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod profile;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -38,13 +39,19 @@ mod host;
 mod indirect;
 pub mod list;
 #[cfg(windows)]
+mod memwait;
+#[cfg(windows)]
 mod memory;
+mod timeline;
+pub mod memstat;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod rects;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -54,20 +61,21 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
-mod switch;
 #[cfg(windows)]
-mod tdr;
+mod ambient;
 #[cfg(windows)]
-mod texture;
+mod compose;
 #[cfg(windows)]
 mod twin;
+#[cfg(windows)]
+mod texpool;
+#[cfg(windows)]
+mod texture;
 #[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+pub use memstat::report as memory_report;
 #[cfg(windows)]
-pub use watch::{
-    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
-    writing as kernel_will_write,
-};
+pub use watch::{title_memory_aliased, title_memory_committed, title_memory_remapped, title_memory_written, writing as kernel_will_write};

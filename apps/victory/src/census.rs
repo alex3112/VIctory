@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use victory_hle::{HleResolver, HostPolicy};
 use victory_loader::Provenance;
 use victory_pe::{ImageInfo, ImportSymbol};
@@ -48,17 +48,10 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
     let mut missing: BTreeMap<(String, String), BTreeSet<PathBuf>> = BTreeMap::new();
 
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root) {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) if error.depth() == 0 => {
-                    return Err(error).context("cannot scan census input");
-                }
-                Err(error) => {
-                    failed.push(error.to_string());
-                    continue;
-                }
-            };
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
             let path = entry.path();
             if !entry.file_type().is_file() || !looks_like_pe(path) {
                 continue;
@@ -74,7 +67,7 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
             {
                 Ok(info) => info,
                 Err(e) => {
-                    failed.push(format!("{}: {e}", path.display()));
+                    failed.push((path.to_path_buf(), e.to_string()));
                     continue;
                 }
             };
@@ -84,8 +77,8 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
     }
 
     println!("{images} images scanned, {} unreadable", failed.len());
-    for error in &failed {
-        println!("  skipped {error}");
+    for (p, e) in &failed {
+        println!("  skipped {}: {e}", p.display());
     }
     println!(
         "\n{:<56} {:>6} {:>6} {:>6} {:>8} {:>7}",

@@ -19,6 +19,8 @@ pub mod dstorage;
 #[cfg(windows)]
 pub mod fidelityfx;
 #[cfg(windows)]
+pub mod dualsense;
+#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -28,8 +30,9 @@ pub mod lifecycle;
 pub mod media;
 #[cfg(windows)]
 pub mod net;
-pub mod rpcrt4;
 pub mod speech;
+#[cfg(windows)]
+pub mod rpcrt4;
 pub mod storage;
 pub mod xasync;
 pub mod xg;
@@ -69,7 +72,6 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(lifecycle::module());
     #[cfg(windows)]
     all.push(net::module());
-    all.push(rpcrt4::module());
     #[cfg(windows)]
     all.push(xmem::module());
     #[cfg(windows)]
@@ -78,5 +80,7 @@ pub(crate) fn all() -> Vec<HleModule> {
     if fidelityfx::serving() {
         all.push(fidelityfx::module());
     }
+    #[cfg(windows)]
+    all.push(rpcrt4::module());
     all
 }

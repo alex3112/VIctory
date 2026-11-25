@@ -63,11 +63,12 @@ const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+const FALLBACK_BUTTONS: [(u8, u32); 15] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
     (0x08, B),    // Backspace
+    (b'O', B),    // Circle, for PlayStation players
     (b'X', X),
     (b'Y', Y),
     (0x26, UP), // arrows
@@ -93,6 +94,18 @@ struct PadState {
     right_y: f32,
 }
 
+/// Motor speeds for one pad, each 0 (off) to `u16::MAX` (full), in the
+/// order of the title's four rumble levels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Motors {
+    /// Low frequency, in the left grip.
+    low: u16,
+    /// High frequency, in the right grip.
+    high: u16,
+    left_trigger: u16,
+    right_trigger: u16,
+}
+
 /// One key held down: scan code (0xE0xx when extended), character, key.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -111,13 +124,9 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// Scripted diagnostic keys (`VICTORY_KEYS`), independent of focus.
-    #[cfg(any(test, feature = "diagnostics"))]
-    fn scripted_keys(&mut self) -> Vec<KeyState> {
-        Vec::new()
-    }
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Motor speeds for the pad in host slot `slot`; a host without
+    /// trigger motors drops those two.
+    fn rumble(&mut self, slot: usize, motors: Motors);
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -139,33 +148,6 @@ fn fallback(keys: &[KeyState]) -> PadState {
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
-    }
-}
-
-/// Combines `extra` (from `VICTORY_KEYS`) onto `base` (a physical host pad).
-#[cfg(any(test, feature = "diagnostics"))]
-fn merge_pad(base: PadState, extra: PadState) -> PadState {
-    PadState {
-        buttons: base.buttons | extra.buttons,
-        left_trigger: base.left_trigger.max(extra.left_trigger),
-        right_trigger: base.right_trigger.max(extra.right_trigger),
-        left_x: (base.left_x + extra.left_x).clamp(-1.0, 1.0),
-        left_y: (base.left_y + extra.left_y).clamp(-1.0, 1.0),
-        right_x: (base.right_x + extra.right_x).clamp(-1.0, 1.0),
-        right_y: (base.right_y + extra.right_y).clamp(-1.0, 1.0),
-    }
-}
-
-/// Applies `scripted` keys to the first connected host pad, so `VICTORY_KEYS`
-/// works even when an XInput or virtual controller disables `FALLBACK`.
-#[cfg(any(test, feature = "diagnostics"))]
-fn merge_scripted(pads: &mut [Option<PadState>; PADS], scripted: &[KeyState]) {
-    if scripted.is_empty() {
-        return;
-    }
-    let extra = fallback(scripted);
-    if let Some(pad) = pads.iter_mut().flatten().next() {
-        *pad = merge_pad(*pad, extra);
     }
 }
 
@@ -435,14 +417,7 @@ impl Hub {
     fn poll(&self) {
         let (pads, keys) = {
             let mut source = lock(&self.source);
-            let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            #[cfg(any(test, feature = "diagnostics"))]
-            {
-                let scripted = source.scripted_keys();
-                merge_scripted(&mut pads, &scripted);
-            }
-            #[cfg(not(any(test, feature = "diagnostics")))]
-            let _ = &mut pads;
+            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys())
         };
         let events = self.state().poll(&self.devices, pads, keys);
@@ -564,7 +539,7 @@ fn host() -> Box<dyn Source> {
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: Motors) {}
     }
     Box::new(Nothing)
 }
@@ -660,8 +635,7 @@ extern "system" fn current_reading(
     hand(out, found)
 }
 
-/// The reading after (`forward`) or before `reference`: on `device`, or with
-/// none given on any device, in time order (ties by device, then sequence).
+/// The reading after (`forward`) or before `reference` on its device.
 fn relative(
     this: This,
     reference: *const Reading,
@@ -676,6 +650,9 @@ fn relative(
     let hub = hub(this);
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
+    // shortcut: with no device given only the reference's device is walked,
+    // not every device's readings in time order; Grand Theft Auto VI walks
+    // only keyboard readings (one device) and the current pad's previous one.
     let Some(index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
     };
@@ -683,38 +660,27 @@ fn relative(
         return fail(out, E_INVALIDARG);
     }
     let state = hub.state();
-    if state.slots[index]
-        .history
+    let history = &state.slots[index].history;
+    if history
         .front()
         .is_none_or(|oldest| reference.sequence < oldest.sequence)
     {
         return fail(out, REFERENCE_TOO_OLD);
     }
-    // On one device this order is its sequence order.
-    let at = (reference.timestamp, index, reference.sequence);
-    let devices = if device.is_null() {
-        0..DEVICES
-    } else {
-        index..index + 1
-    };
-    let candidates = devices
-        .flat_map(|i| {
-            let history = &state.slots[i].history;
-            history
-                .iter()
-                .map(move |r| ((r.timestamp, i, r.sequence), r))
-        })
-        .filter(|(_, r)| r.kind() & kind != 0);
+    let wanted = |r: &&Ref| r.kind() & kind != 0;
     let found = if forward {
-        candidates
-            .filter(|(key, _)| *key > at)
-            .min_by_key(|(key, _)| *key)
+        history
+            .iter()
+            .filter(|r| r.sequence > reference.sequence)
+            .find(wanted)
     } else {
-        candidates
-            .filter(|(key, _)| *key < at)
-            .max_by_key(|(key, _)| *key)
+        history
+            .iter()
+            .rev()
+            .filter(|r| r.sequence < reference.sequence)
+            .find(wanted)
     };
-    hand(out, found.map(|(_, r)| r))
+    hand(out, found)
 }
 extern "system" fn next_reading(
     this: This,
@@ -956,24 +922,28 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+// Grand Theft Auto VI sends trigger levels in slot 0x50; all four reach the
+// host, which drops the trigger motors (see `host::Host::rumble`).
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let [low, high, left_trigger, right_trigger] = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    let motors = Motors {
+        low: speed(low),
+        high: speed(high),
+        left_trigger: speed(left_trigger),
+        right_trigger: speed(right_trigger),
+    };
+    lock(&device.hub().source).rumble(device.index, motors);
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1180,30 +1150,34 @@ mod host {
         empty_until: [Option<Instant>; PADS],
     }
 
-    fn key_state(vk: u8) -> KeyState {
-        KeyState {
-            // SAFETY: plain query.
-            scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-            virtual_key: vk,
-            // shortcut: no characters (code point 0); Grand Theft
-            // Auto VI reads scan codes and virtual keys only.
-            ..Default::default()
-        }
-    }
-
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
-            }
-            let mut state = XINPUT_STATE::default();
-            // SAFETY: room for the state.
-            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
+            let empty = self.empty_until[slot].is_some_and(|until| Instant::now() < until);
+            if !empty {
+                let mut state = XINPUT_STATE::default();
+                // SAFETY: room for the state.
+                if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
+                    self.empty_until[slot] = None;
+                    return Some(convert(&state.Gamepad));
+                }
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
             }
-            self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            // A DualSense is a HID device, not an XInput one; it plays slot 0
+            // when no XInput pad answers there.
+            if slot == 0
+                && let Some(pad) = super::super::dualsense::latest()
+            {
+                return Some(PadState {
+                    buttons: pad.buttons,
+                    left_trigger: pad.left_trigger,
+                    right_trigger: pad.right_trigger,
+                    left_x: pad.left_x,
+                    left_y: pad.left_y,
+                    right_x: pad.right_x,
+                    right_y: pad.right_y,
+                });
+            }
+            None
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1221,25 +1195,26 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            down.into_iter().map(key_state).collect()
+            down.into_iter()
+                .map(|vk| KeyState {
+                    // SAFETY: plain query.
+                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                    virtual_key: vk,
+                    // shortcut: no characters (code point 0); Grand Theft
+                    // Auto VI reads scan codes and virtual keys only.
+                    ..Default::default()
+                })
+                .collect()
         }
 
-        #[cfg(any(test, feature = "diagnostics"))]
-        fn scripted_keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            {
-                scripted().into_iter().map(key_state).collect()
-            }
-            #[cfg(not(feature = "diagnostics"))]
-            {
-                Vec::new()
-            }
-        }
-
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+        // shortcut: trigger motors are dropped (XInput has none). The host
+        // API that drives them without a redistributable is
+        // Windows.Gaming.Input (WinRT `Gamepad.Vibration`), which needs WinRT
+        // bindings this crate lacks outside diagnostics builds.
+        fn rumble(&mut self, slot: usize, motors: Motors) {
             let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
+                wLeftMotorSpeed: motors.low,
+                wRightMotorSpeed: motors.high,
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
@@ -1256,20 +1231,7 @@ mod host {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = key_named(key.trim())?;
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
@@ -1282,7 +1244,65 @@ mod host {
         keys.iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
+            .chain(asked())
             .collect()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn key_named(name: &str) -> Option<u8> {
+        Some(match name {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
+    /// Debugging aid: keys as in `VICTORY_KEYS`, one per line of the file
+    /// `VICTORY_KEYS_FILE`, each held for 0.2 s once its line is there.
+    #[cfg(feature = "diagnostics")]
+    fn asked() -> Option<u8> {
+        struct Asked {
+            looked: Instant,
+            done: usize,
+            held: Option<(Instant, u8)>,
+        }
+        static ASKED: LazyLock<std::sync::Mutex<Asked>> = LazyLock::new(|| {
+            std::sync::Mutex::new(Asked { looked: Instant::now(), done: 0, held: None })
+        });
+        static FILE: LazyLock<Option<std::ffi::OsString>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE"));
+        let file = FILE.as_ref()?;
+        let mut a = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if let Some((since, vk)) = a.held {
+            let age = now - since;
+            if age < Duration::from_millis(200) {
+                return Some(vk);
+            }
+            if age < Duration::from_millis(600) {
+                return None;
+            }
+            a.held = None;
+        }
+        if now - a.looked < Duration::from_millis(100) {
+            return None;
+        }
+        a.looked = now;
+        let lines = std::fs::read_to_string(file).ok()?;
+        let name = lines.lines().nth(a.done)?.trim().to_owned();
+        a.done += 1;
+        tracing::info!(key = name, "a key was asked for");
+        a.held = key_named(&name).map(|vk| (now, vk));
+        a.held.map(|h| h.1)
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1332,8 +1352,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        scripted: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, Motors)>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -1345,11 +1364,8 @@ mod tests {
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
-        fn scripted_keys(&mut self) -> Vec<KeyState> {
-            self.0.lock().unwrap().scripted.clone()
-        }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(&mut self, slot: usize, motors: Motors) {
+            self.0.lock().unwrap().rumble.push((slot, motors));
         }
     }
 
@@ -1540,54 +1556,6 @@ mod tests {
     }
 
     #[test]
-    fn with_no_device_readings_are_walked_across_devices_in_time_order() {
-        type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
-        let any = |hub: &Hub, offset, from, kind| {
-            let mut out = std::ptr::null();
-            let walk = slot::<Walk, _>(&hub.object, offset);
-            result(
-                walk(&hub.object, from, kind, std::ptr::null(), &mut out),
-                out,
-            )
-        };
-        let both = GAMEPAD_KIND | KEYBOARD_KIND;
-        let tick = || std::thread::sleep(Duration::from_millis(2));
-        let (hub, host) = fake();
-        // The first poll: the stand-in pad and the keyboard, at one time.
-        let stand_in = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
-        let no_keys = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
-        tick();
-        host.lock().unwrap().pads[1] = Some(PadState::default());
-        hub.poll();
-        let pad_a = current(hub, GAMEPAD_KIND, 1).unwrap();
-        tick();
-        host.lock().unwrap().keys = vec![key(b'W')];
-        hub.poll();
-        let w = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
-        tick();
-        host.lock().unwrap().pads[1].as_mut().unwrap().buttons = B;
-        hub.poll();
-        let pad_b = current(hub, GAMEPAD_KIND, 1).unwrap();
-
-        let order = [stand_in, no_keys, pad_a, w, pad_b];
-        for pair in order.windows(2) {
-            assert_eq!(any(hub, 0x28, pair[0], both), Ok(pair[1]));
-            assert_eq!(any(hub, 0x30, pair[1], both), Ok(pair[0]));
-        }
-        assert_eq!(any(hub, 0x30, stand_in, both), Err(READING_NOT_FOUND));
-        assert_eq!(any(hub, 0x28, pad_b, both), Err(READING_NOT_FOUND));
-        // Only gamepads: the keyboard's readings are skipped.
-        assert_eq!(any(hub, 0x28, stand_in, GAMEPAD_KIND), Ok(pad_a));
-        assert_eq!(any(hub, 0x28, pad_a, GAMEPAD_KIND), Ok(pad_b));
-        assert_eq!(any(hub, 0x30, pad_a, GAMEPAD_KIND), Ok(stand_in));
-        // Naming the device keeps the walk on it.
-        assert_eq!(walk(hub, 0x30, pad_a), Err(READING_NOT_FOUND));
-        for r in order {
-            release(r);
-        }
-    }
-
-    #[test]
     fn keys_feed_the_keyboard_and_the_stand_in_pad() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1724,42 +1692,40 @@ mod tests {
         rumble(device, &[0.5, 1.0, 1.0, 1.0]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        let full = Motors {
+            low: 32767,
+            high: 65535,
+            left_trigger: 65535,
+            right_trigger: 65535,
+        };
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [(2, full), (2, Motors::default())]
+        );
     }
 
     #[test]
-    fn scripted_keys_merge_into_connected_host_pad() {
+    fn trigger_rumble_reaches_the_host() {
         let (hub, host) = fake();
-        let physical = PadState {
-            buttons: B,
-            left_x: -0.5,
-            ..Default::default()
-        };
-        {
-            let mut h = host.lock().unwrap();
-            h.pads[1] = Some(physical);
-            h.scripted = vec![key(0x0D), key(b'W'), key(b'C')];
-        }
+        host.lock().unwrap().pads[1] = Some(PadState::default());
         hub.poll();
-
-        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
-        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
-        assert_eq!(
-            pad(r),
-            PadState {
-                buttons: B | A,
-                left_x: -0.5,
-                left_y: 1.0,
-                right_trigger: 1.0,
-                ..Default::default()
-            }
-        );
-        release(r);
-
-        host.lock().unwrap().scripted.clear();
-        hub.poll();
-        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
-        assert_eq!(pad(r), physical);
-        release(r);
+        let device = &hub.devices[1] as *const Device;
+        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
+        let rumble = slot::<Rumble, _>(device, 0x50);
+        // Out-of-range and NaN levels clamp or fall to off, like the grips.
+        rumble(device, &[0.0, 0.0, 0.25, 2.0]);
+        rumble(device, &[0.0, 0.0, -1.0, f32::NAN]);
+        let expected = [
+            (
+                1,
+                Motors {
+                    left_trigger: 16383,
+                    right_trigger: 65535,
+                    ..Motors::default()
+                },
+            ),
+            (1, Motors::default()),
+        ];
+        assert_eq!(host.lock().unwrap().rumble, expected);
     }
 }

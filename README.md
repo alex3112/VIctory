@@ -1,3 +1,124 @@
+# VIctory fork for AMD Radeon (work in progress)
+
+Local integration: this branch merges our upstream-based runtime and memory
+optimizations with Belobug AMD `4cbe9d7`. See
+[integration notes](docs/belobug-integration.md) for conflict resolutions,
+retained commands and cache compatibility. The measurements below describe
+Belobug's reference machine, not a benchmark of this merged build.
+
+This is a fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
+and its contributors. It follows upstream `main` up to `8e79c80` (2026-11-24),
+carries a number of upstream pull requests, and adds fixes found while running
+the game's world on one AMD card.
+
+**This repository contains no game files, code or assets.** You need your own
+copy of the game. It is not affiliated with or endorsed by the game's
+developer or publisher.
+
+## State of this fork (2026-11-25)
+
+**Not playable yet: 3 to 5 frames per second.** Tested on one machine only:
+Windows 11, AMD Radeon RX 9070 XT 16 GB, Ryzen 7 9800X3D, 64 GB RAM, Series X
+profile. Nothing here has been run on an NVIDIA or Intel card.
+
+| What | State on that machine |
+|------|-----------------------|
+| Boot, menus | work, 30 fps (as upstream) |
+| The world | renders lit, with textures, people, vehicles, vegetation, water and sky |
+| Saves | load and store |
+| Frame rate in the world | 3 to 5 fps (4.4 to 4.9 standing still in a heavy scene, about 3 while driving) |
+| Light in shadow | a constant: the game's ray-traced indirect light does not run, so shaded places are flat and rather dark |
+| Distant trees | not drawn (see below) |
+| Vehicles in motion | **broken**: parts of moving vehicles are left behind or stretched across the screen; under investigation |
+| Memory | about 22 GB of RAM and more video memory than a 16 GB card has |
+
+A driver timeout (Windows resets the display driver, every monitor goes black
+for a moment) happened once in the session this was written in. Expect it.
+
+### What this fork changes over upstream
+
+Picture:
+- The world's indirect diffuse light is replaced by a constant while the ray
+  passes do not run. What the game's resolve pass left instead was bright
+  magenta on leaves, cloth and paper, and blocks of colours indoors
+  (`VICTORY_AMBIENT=<level>`, 0.6 by default; `off` keeps the game's output).
+- In pixel shaders every read of another pixel of the same 2x2 quad goes
+  through quad reads, helper pixels included. Wave reads return 0 from helper
+  pixels on AMD, which showed as lines along every triangle on car paint,
+  glass and skin. Upstream does this after discards only.
+- A helper pixel's `v_readfirstlane` reads its own value (upstream `0601955`).
+- Twice the dynamic descriptor slots, so the tables of heavy frames fit.
+- Depth and stencil twins for depth textures written by compute, screen
+  passes with pipeline workers of their own, textures told apart by the mips
+  their memory really holds, and other fixes listed in the history.
+
+Speed:
+- The clamps of a run of indirect draws are recorded in a list before the
+  list that draws, and run one after another (`VICTORY_HOIST_CLAMPS`, 7 by
+  default, 0 for each before its draw): 225 to about 80 ms of GPU time per
+  frame in a scene of 9,000 draws.
+- Shader cache entries of another build can be reused
+  (`VICTORY_SHADER_BUILD_OF=<executable>`, diagnostics).
+
+AMD:
+- Shaders that crash or never leave the AMD driver's compiler cost only
+  their pipeline, not the run.
+- Buffer element counts come from the host's own table, not a size query the
+  driver's compiler crashes on.
+
+Diagnostics (diagnostics builds): `VICTORY_SHADER_PATCH` changes one word of a
+shader's machine code before translation, `VICTORY_SHADER_SWAP` replaces
+shader containers by files, `VICTORY_ALWAYS_COPY=1` refreshes every copy of
+title memory each frame, `VICTORY_GPU_TIMING=1` logs GPU time per pipeline.
+Each is described in a comment where it is read.
+
+### How it is run here
+
+A diagnostics build (`cargo build --profile diag -p victory --features
+diagnostics`), with:
+
+```
+VICTORY_PRESENT_TARGET=1x1:1
+VICTORY_HAIR=1
+VICTORY_SKIP_PIPELINES=4e35b816f2f91d68,b3ba0ef9ee352720,5d627391703fcb4c,ec6e4c363cf9ef2b,c89489afd89ee7f0,45f081396c2c59ba,63083c777948927a,0bd4d80ad23b106b
+victory run <game_scarlett_master.exe> --execute --console series-x
+```
+
+The skipped pipelines are the distant trees' imposters: their wind variants
+read volumes nothing fills yet and throw their quads across the screen.
+The first launch after a build translates every shader and builds about
+2,500 pipelines; the loading screen can stay frozen, with sound, for minutes.
+
+### Known problems
+
+- Moving vehicles lose or stretch parts (see the table).
+- No ray-traced light; the constant that stands in for it is the same
+  everywhere.
+- No distant trees.
+- Some compute programs do not translate (ray-tracing structure builders,
+  wind volumes, a few others) and their passes are dropped.
+- Many changes are specific to this title and this GPU, and some are marked
+  `shortcut:` in the code where they approximate what the console does.
+
+### Credits
+
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
+  contributors is the base of everything here. Licensed GPL-3.0-or-later; so
+  is this fork. Upstream's history and the authors of the pull requests
+  carried here are kept in the commit history.
+- [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and
+  [myokex/victory-amd](https://github.com/myokex/victory-amd) were read for
+  comparison; no code of theirs is in this fork.
+- [XCL](https://github.com/ivall/xcl) by ivall: its README was read; no code
+  of it is here.
+- This fork's changes were developed with
+  [Claude Code](https://claude.com/claude-code) and Gemini (Antigravity).
+
+Everything below this line is upstream VIctory's own README, unchanged; its
+status section describes upstream, not this fork.
+
+---
+
 # VIctory
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
@@ -5,13 +126,13 @@ the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
 the platform underneath it and converts the title's data, ahead of time where
-it can (shaders and pipelines too, see Getting started) and on first use
-otherwise. See [docs/architecture.md](docs/architecture.md).
+it can and on first use where it must (shaders). See
+[docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-24)
+## Status (2026-11-23)
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps,
-loads the world and shows it: slowly, and with rendering defects.
+**Not playable yet.** The title boots, runs its menus at its own 30 fps and
+loads the world, where rendering fails.
 
 | Stage | State |
 |-------|-------|
@@ -19,16 +140,14 @@ loads the world and shows it: slowly, and with rendering defects.
 | Intro video with sound | works |
 | Start screen, profile and saves | works |
 | Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | drawn and shown: streets, buildings, vehicles, characters, the title card and credits; 1-2 s per frame. Surfaces are unlit, a band of distant geometry is missing, characters come out broken in some shots |
+| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
 
 Tested on one machine: Windows 11, AMD RX 6700 XT.
 
-> **Warning.** Entering the world on a real GPU has hung it in earlier
-> builds, and Windows then resets the display driver (every monitor goes
-> black for a moment). The latest runs did not, but it is not ruled out; a
-> run can also end on a GPU fault (`crashes.log`). A diagnostics build with
-> `VICTORY_D3D12_WARP=1` renders on the software adapter instead (too slow
-> to reach the world in minutes).
+> **Warning.** Entering the world on a real GPU can currently hang it, and
+> Windows then resets the display driver (every monitor goes black for a
+> moment). To look further, use a diagnostics build with
+> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
 
 What each part does today and what it still needs:
 
@@ -41,22 +160,22 @@ What each part does today and what it still needs:
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: mesh 8,765 of 8,765, vertex/pixel 12,550 of 12,592, compute 2,579 of 2,637 | Merged geometry stages (195 programs) and about 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
+| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk, depth bounds on supporting adapters (synthetic tests); occlusion, pipeline statistics and timestamp queries run on the host GPU | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; HDR and scaling are missing; console-only query types get stand-in results |
+| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | Merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
+
+In an offline scan of `shaders.rpf`, SM 6.6 texture atomics recovered
+520 shader translations. Specializing proven branch outcomes recovered
+another 108 by keeping descriptor words off paths that consume buffer data.
+Microsoft's DXIL validator accepted all 628 shaders. Game rendering with
+these shader changes still needs a Windows D3D12 run.
 
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
-
-To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
-the installer from https://rustup.rs). The first `cargo` command in this
-repository then fetches the pinned toolchain. Building needs the MSVC C++
-build tools: Visual Studio or its Build Tools with the "Desktop development
-with C++" workload.
 
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
@@ -74,48 +193,23 @@ Run the title:
 
 ```powershell
 cargo build --release -p victory
-target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
-
-The `translate --cache` step (minutes; again after a change of the shader
-translator) translates every shader the title can ask for into the cache
-(about 1.3 GB), so a run does not translate them while it plays; without it
-they are translated at first use, and their draws wait. With `--pipelines`
-it then makes every pipeline in the title's shader pack (inside
-`shaders.rpf`) into the host pipeline library (about 27,000 pipelines, 4 MB;
-some 20 minutes on 16 threads, most of it the 2,700 compute ones), so a run
-compiles none of those either; the library belongs to the GPU and driver it
-was made on. Run again, it skips what is there in seconds; stopped
-early, it keeps what it made.
-
-Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
-it with the PC build on your GPU instead of the console build, get the
-[FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
-and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
-`Kits/FidelityFX/signedbin` folder, which holds
-`amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
-upscaler for your GPU (the log says so), the title's own DLLs run.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
-top-level window to that bounding box. Smaller windows keep their size,
-larger windows keep their proportions, and the monitor's work area still
-limits them. This scales the displayed image; it does not change the
-console render resolution or the swap-chain buffers. With the variable
-unset, window sizing is unchanged.
-
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads. A DualSense or DualSense Edge (USB or Bluetooth) is read
+over HID as well and plays as the first pad when no XInput pad answers. With
+no pad connected the keyboard is a pad while the title's window has focus:
 
 | Keys | Pad |
 |------|-----|
 | W A S D / I J K L | left / right stick |
 | arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
+| Enter, O | A, B |
+| Backspace, X, Y | B, X, Y |
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
@@ -126,9 +220,8 @@ title's window has focus:
 victory inspect <exe|dll> [--imports] [--exports]
 victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm] [--effects]
+victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
@@ -136,24 +229,6 @@ victory config
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
-
-### Windows shader-test validator
-
-The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
-An older Windows SDK validator can load successfully but reject them with
-`Unknown shader model 'ps_6_6'`. If this happens, use a current x64 validator
-from [Microsoft's DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
-or a current Windows SDK. Set its path for the test session:
-
-```powershell
-$env:VICTORY_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
-cargo test -p victory-shader --lib --locked -- --test-threads=1
-```
-
-Without this override, the validator loader selects the newest installed
-Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
-path when no SDK copy is found. This is a test/offline-validation dependency;
-the translated shaders do not require it at runtime.
 
 ## Debugging
 
@@ -163,31 +238,22 @@ A release build has no debugging aids. Build them in with
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
-The on/off switches below (`...=1`) are off when unset or set to `0`.
-
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
-| `VICTORY_DUMP_WRITERS=<hash>,...` | with the two above, also the textures a pipeline containing a listed shader hash writes, the first frame it runs, and for its buffers a log line (dwords changed, dwords not zero) |
-| `VICTORY_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged after each submission. Listed frames also log targets of 16 texels or fewer as values, each table view's view words and whether its host slot is null, the host copy of every buffer of 64 bytes or fewer a draw reads (at submission and after its list), and each 1D or 3D texture a dispatch writes, read back right after it |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
-| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500) |
+| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
-| `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |

@@ -205,7 +205,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         Ok(p) if keys_only.is_some() => {
             lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe()))
         }
-        Ok(p) if pipeline::prebuilt(&p.key()) => drop(listed.fetch_add(1, Ordering::Relaxed)),
+
         Ok(p) => lock(&todo).push((!pipeline::wanted_early(&p.key()), job)),
         Err(why) => {
             if keys_only.is_some() {

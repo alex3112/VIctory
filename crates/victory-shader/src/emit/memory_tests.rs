@@ -1,615 +1,864 @@
-//! Title memory at addresses the program computes (decision 0005, the
-//! unified-memory item), run on the host GPU and WARP with the test host
-//! serving the contract (`emit` "Title memory"): a synthetic GFX10 program
-//! takes a 64-bit pointer from root constants, reads through it with a
-//! global and a scalar load, follows a pointer it loaded with another
-//! scalar load, stores through a pointer it computes (64-bit multiply-add)
-//! and does float min/max atomics, reads through the address it takes
-//! from a buffer view's descriptor (the host's view addresses), reads
-//! pointers into memory no copy holds (zeros, marked missed) and stores and
-//! loads through a root UAV (title memory in such a program).
-
-use super::host::{Dispatch, Host, Root, View};
-use super::{HostShader, lower, validator};
+//! Hand-encoded GFX10 compute programs, with a raw UAV for readback.
+use super::{Container, HostShader, emit};
+use crate::gfx10::{Encoding, Fields, NULL, Operand};
 use crate::native::{
-    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    ComputeIo, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
-use crate::{io, ir, resource, structure};
+use crate::{HwStage, ShaderError, gfx10, io, ir, resource, structure};
 
-const S_ENDPGM: u32 = 0xBF81_0000;
-const S_WAITCNT_ALL: u32 = 0xBF8C_0000;
-/// Inline constant 0, 64.
-const ZERO: u16 = 128;
-const SIXTY_FOUR: u16 = 192;
-/// The title address of the memory the program reads: above 4 GiB.
-const TITLE: u64 = 0x12_3450_0000;
-
-const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
-    0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
-}
-
-/// SMEM `s_load_dword*` (`op` 0, 1, 2: one, two, four dwords) at
-/// `s[base:base+1] + offset`.
-const fn s_load(op: u32, sdata: u8, sbase: u8, offset: u32) -> [u32; 2] {
+fn ds(op: u32, offset: u32, dst: u32, addr: u32, data0: u32, data1: u32) -> [u32; 2] {
     [
-        0x3D << 26 | op << 18 | (sdata as u32) << 6 | (sbase as u32 >> 1),
-        125 << 25 | offset,
+        0xD800_0000 | op << 18 | offset,
+        dst << 24 | data1 << 16 | data0 << 8 | addr,
     ]
 }
 
-/// VOP1 `v_mov_b32 vdst, src0`.
-const fn v_mov_b32(vdst: u8, src0: u16) -> u32 {
-    0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | (src0 as u32 & 0x1FF)
-}
-
-/// GLOBAL `op` with address `s[saddr:saddr+1] + vaddr + offset`.
-const fn global(op: u32, vdst: u8, vaddr: u8, data: u8, saddr: u8, offset: u32) -> [u32; 2] {
+// s[8:11] is a descriptor loaded through the table in s4.
+fn buf(op: u32, offset: u32, data: u32, flags: u32) -> [u32; 2] {
     [
-        0x37 << 26 | op << 18 | 2 << 14 | (offset & 0xFFF),
-        vaddr as u32 | (data as u32) << 8 | (saddr as u32) << 16 | (vdst as u32) << 24,
+        0xE000_0000 | (op & 127) << 18 | (op >> 7) << 25 | flags | offset,
+        0x8002_0000 | data << 8,
     ]
 }
 
-/// MUBUF `buffer_store_dword vdata, off, s[srsrc:srsrc+3], 0 offset:byte_off`.
-const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
-    [
-        0x38 << 26 | 0x1C << 18 | (byte_off as u32 & 0xFFF),
-        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
-    ]
+fn mov(body: &mut Vec<u32>, reg: u32, value: u32) {
+    body.extend([0x7E00_02FF | reg << 17, value]); // v_mov_b32 with a literal
 }
 
-fn program() -> HostShader {
-    let mut w = vec![s_mov_b32(5, 0x80)]; // s[4:5]: the table at s4
-    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
-    w.push(v_mov_b32(1, ZERO));
-    w.extend(global(12, 2, 1, 0, 0, 0)); // global_load_dword v2, v1, s[0:1]
-    w.extend(s_load(1, 12, 0, 8)); // s[12:13] = the pointer at +8
-    w.push(S_WAITCNT_ALL);
-    w.extend(s_load(0, 14, 12, 0)); // s14 = what it points at
-    w.push(v_mov_b32(3, SIXTY_FOUR));
-    w.push(v_mov_b32(4, 2)); // v4 = s2
-    // v_mad_u64_u32 v[8:9], s[20:21], v3, 1, s[0:1]: the pointer plus 0x40,
-    // stored through as a VGPR pair.
-    w.extend([0xD576_1408, 0x0001_0303]);
-    w.extend(global(28, 0, 8, 4, 0x7D, 0)); // global_store_dword v[8:9], v4, off
-    w.push(v_mov_b32(6, 3)); // v6 = s3 (a float)
-    w.extend(global(63, 0, 3, 6, 0, 0x40)); // global_atomic_fmin at +0x80
-    w.extend(global(64, 0, 3, 6, 0, 0x44)); // global_atomic_fmax at +0x84
-    // The address of the view at heap index 1 from its descriptor (as the
-    // tracers take their BVH's), read through.
-    w.extend(s_load(1, 16, 4, 0x20)); // s[16:17] = descriptor 1, dwords 0-1
-    w.push(S_WAITCNT_ALL);
-    w.extend(s_load(0, 18, 16, 0x100)); // s18 = the dword at +0x100
-    w.push(S_WAITCNT_ALL);
-    // Pointers into a page no copy holds and into a 256 MiB region with no
-    // block, read through: zeros, and both marked missed.
-    w.extend(s_load(1, 22, 0, 0x10)); // s[22:23]
-    w.extend(s_load(1, 24, 0, 0x18)); // s[24:25]
-    w.push(S_WAITCNT_ALL);
-    w.extend(s_load(0, 26, 22, 0));
-    w.extend(s_load(0, 27, 24, 0));
-    w.push(S_WAITCNT_ALL);
-    w.push(v_mov_b32(5, 14));
-    w.push(v_mov_b32(7, 18));
-    w.extend(buffer_store_dword(2, 8, 0));
-    w.extend(buffer_store_dword(5, 8, 4));
-    w.extend(buffer_store_dword(7, 8, 8));
-    w.push(v_mov_b32(5, 26));
-    w.push(v_mov_b32(7, 27));
-    w.extend(buffer_store_dword(5, 8, 12));
-    w.extend(buffer_store_dword(7, 8, 16));
-    // A root UAV (s[6:7]), title memory in such a program: a store and a
-    // load at its address.
-    w.extend(global(28, 0, 1, 4, 6, 0x20)); // global_store_dword v1, v4, s[6:7]
-    w.extend(global(12, 9, 1, 0, 6, 0x24)); // global_load_dword v9, v1, s[6:7]
-    w.push(S_WAITCNT_ALL);
-    w.extend(buffer_store_dword(9, 8, 20));
-    w.push(S_ENDPGM);
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 10,
-        layout: vec![
-            RootParam {
-                root: RootType::Constants,
-                table_offset_dwords: 0,
-                sgprs: 4,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            },
-            RootParam {
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 4,
-                slot: 1,
-            },
-            RootParam {
-                root: RootType::Descriptor,
-                table_offset_dwords: 0,
-                sgprs: 2,
-                base_register: 0,
-                user_data: 6,
-                slot: 2,
-            },
-        ],
-        used: vec![
-            UsedResource {
-                kind: ResourceType::Uav,
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 4,
-                user_data: 4,
-                slot: 1,
-            },
-            UsedResource {
-                kind: ResourceType::Uav,
-                root: RootType::Descriptor,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 2,
-                user_data: 6,
-                slot: 2,
-            },
-        ],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 8 << 1,
-            threads: [1, 1, 1],
-        }),
-        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let memory = res.scalar.iter().filter(|s| s.1.param == resource::MEMORY).count();
-    assert_eq!(memory, 11, "every access through the pointer is title memory");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let l = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        view_marks: false,
-    })
-    .expect("lower");
-    assert!(l.memory && l.memory_writes && l.view_addresses);
-    assert!(l.root_uavs.is_empty(), "the root UAV is read as title memory");
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: l.dxil,
-        user_data: l.user_data,
-        samplers: l.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: l.root_cbvs,
-        root_srvs: l.root_srvs,
-        root_uavs: l.root_uavs,
-        memory: l.memory,
-        memory_writes: l.memory_writes,
-        view_addresses: l.view_addresses,
-        heap: l.heap,
-        heap_writes: l.heap_writes,
-        view_marks: l.view_marks,
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
-    }
-    shader
+fn shader(body: &[u32], threads: u32) -> Result<HostShader, ShaderError> {
+    shader_with(body, threads, None, 0)
 }
 
-/// The page table for one copy of title memory at [`TITLE`] whose views
-/// are at heap index `view` (null pair at `null`).
-fn page_table(view: u32, null: u32) -> Vec<u32> {
-    let mut t = vec![0u32; 4096];
-    let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
-    t[(hi << 4 | lo >> 28) as usize] = 1;
-    for _ in 0..2 * 4096 {
-        t.extend([null, 0]);
-    }
-    let entry = 4096 + 2 * (4096 + (lo >> 16 & 0xFFF) as usize);
-    t[entry..entry + 2].copy_from_slice(&[view, lo]);
-    t
-}
-
-#[test]
-fn title_memory_is_read_and_written_at_computed_addresses() {
-    let shader = program();
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut memory = vec![0u32; 256];
-    memory[0] = 0x1111_1111;
-    let pointer = TITLE + 0x100;
-    memory[2] = pointer as u32;
-    memory[3] = (pointer >> 32) as u32;
-    // The next page (no copy) and another 256 MiB region (no block).
-    let (next, far) = (TITLE + 0x1_0010, 0x55_0000_0040u64);
-    memory[4..8].copy_from_slice(&[next as u32, (next >> 32) as u32, far as u32, (far >> 32) as u32]);
-    memory[0x40] = 0x2222_2222;
-    // The root UAV's address, and what it loads there.
-    let root_uav = TITLE + 0x200;
-    memory[(0x200 + 0x24) / 4] = 0x3333_3333;
-    memory[0x80 / 4] = 1.0f32.to_bits();
-    memory[0x84 / 4] = (-1.0f32).to_bits();
-    let value = 0xCAFE_F00D;
-    // Heap index 1 (the memory's view) has the title address.
-    let mut view_addresses = vec![0u32; 2 * 5];
-    view_addresses[2..4].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
-        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        // fmin with 1.0 and fmax with -1.0 in memory, against a negative
-        // and a positive operand.
-        for operand in [-2.0f32, 0.5] {
-            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
-            for u in &shader.user_data {
-                let constants = [TITLE as u32, (TITLE >> 32) as u32, value, operand.to_bits()];
-                ud[u.index as usize] = match u.root {
-                    RootType::Constants => constants[u.dword as usize],
-                    RootType::Descriptor => (root_uav >> (32 * u.dword)) as u32,
-                    _ => 0,
-                };
-            }
-            let out = host
-                .dispatch(
-                    &root,
-                    &pso,
-                    &Dispatch {
-                        roots: vec![
-                            (0, Root::Constants(ud)),
-                            (1, Root::View { srv: true, data: page_table(1, 3) }),
-                            (2, Root::Uav(2 * 4096 / 32)),
-                            (3, Root::View { srv: true, data: view_addresses.clone() }),
-                        ],
-                        views: &[
-                            View::RawUav(6),
-                            View::Memory(&memory),
-                            View::Pair,
-                            View::NullPair,
-                            View::Pair,
-                        ],
-                        samplers: &[],
-                        groups: [1, 1, 1],
-                    },
-                )
-                .unwrap_or_else(|e| panic!("{label}: {e}"));
-            assert_eq!(
-                out[0],
-                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333],
-                "{label}: reads"
-            );
-            assert_eq!(out[1][0x40 / 4], value, "{label}: the store");
-            assert_eq!(out[1][(0x200 + 0x20) / 4], value, "{label}: the root UAV store");
-            let floats = [f32::from_bits(out[1][0x20]), f32::from_bits(out[1][0x21])];
-            let want = [operand.min(1.0), operand.max(-1.0)];
-            assert_eq!(floats, want, "{label}: float min and max");
-            // The far region by its level-1 index, the page written, the
-            // page missed after it; nothing else.
-            let entry = 4096 + (TITLE as u32 >> 16 & 0xFFF) as usize;
-            let marked: Vec<usize> = (0..out[2].len() * 32)
-                .filter(|&b| out[2][b / 32] >> (b % 32) & 1 != 0)
-                .collect();
-            assert_eq!(marked, [(far >> 28) as usize, entry, entry + 1], "{label}: pages");
-        }
-        ran += 1;
-    }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
-}
-
-/// A root SRV in a program that does not use title memory is read through
-/// the host's view of its host copy (`emit`, "Root SRVs and root UAVs"): the
-/// view's index and the root address's offset in it come as user data, and
-/// the shader adds the offset. Lanes read 64 bytes apart from the root
-/// address 16 bytes into a 1 KiB copy: those inside it read the copy, those
-/// past its end read 0 (a host root descriptor read whatever lay there).
-#[test]
-fn root_views_read_their_copy_and_zeros_past_it() {
-    const fn vop2(op: u32, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
-        op << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | src0 as u32
-    }
-    /// MUBUF `op` (offen) of `vdata` at `vaddr` through `s[srsrc:srsrc+3]`.
-    const fn mubuf(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
-        [0x38 << 26 | op << 18 | 1 << 12, 0x80 << 24 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32]
-    }
-    const V_LSHLREV_B32: u32 = 0x1A;
-    let mut w = vec![
-        s_mov_b32(5, ZERO as u8), // s[4:5]: the table at s4
-        s_mov_b32(0, 6),          // s[0:3]: the root SRV's buffer descriptor
-        0x8801_FF07,
-        0x0001_0000, // s_or_b32 s1, s7, stride 1
-        0xBE82_03C1, // s_mov_b32 s2, -1
-        0xBE83_03FF,
-        0x1101_4FAC, // s_mov_b32 s3, (the console's buffer word 3)
+fn shader_with(
+    body: &[u32],
+    threads: u32,
+    root_view: Option<ResourceType>,
+    stride: u32,
+) -> Result<HostShader, ShaderError> {
+    let mut words = vec![
+        0xBE85_0380u32, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
     ];
-    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
-    w.push(vop2(V_LSHLREV_B32, 1, 128 + 6, 0)); // v1 = lane << 6
-    w.extend(mubuf(0x0C, 2, 1, 0)); // buffer_load_dword v2, v1, s[0:3] offen
-    w.push(vop2(V_LSHLREV_B32, 3, 128 + 2, 0)); // v3 = lane << 2
-    w.push(S_WAITCNT_ALL);
-    w.extend(mubuf(0x1C, 2, 3, 8)); // buffer_store_dword v2, v3, s[8:11] offen
-    w.push(S_ENDPGM);
-    let native = NativeProgram {
+    if stride != 0 {
+        words.extend([0xF408_0302, 0xFA00_0020]); // second descriptor in s[12:15]
+    }
+    let code: Vec<_> = words
+        .iter()
+        .chain(body)
+        .chain(&[0xBF81_0000])
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let mut native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 4,
-        layout: vec![
-            RootParam {
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 4,
-                slot: 1,
-            },
-            RootParam {
-                root: RootType::Descriptor,
-                table_offset_dwords: 0,
-                sgprs: 2,
-                base_register: 0,
-                user_data: 6,
-                slot: 2,
-            },
-        ],
-        used: vec![
-            UsedResource {
-                kind: ResourceType::Uav,
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 4,
-                user_data: 4,
-                slot: 1,
-            },
-            UsedResource {
-                kind: ResourceType::Srv,
-                root: RootType::Descriptor,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 1,
-                dwords: 4,
-                user_data: 6,
-                slot: 2,
-            },
-        ],
+        vgprs: 64,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 0,
+        }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 8 << 1,
-            threads: [32, 1, 1],
+            rsrc2: (5 << 1) | (2 << 15),
+            threads: [threads, 1, 1],
         }),
-        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        code,
     };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let l = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        view_marks: false,
-    })
-    .expect("lower");
-    assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
-    let marks: Vec<(u32, u32)> = l
-        .user_data
-        .iter()
-        .filter(|u| u.root == RootType::Descriptor)
-        .map(|u| (u.index, u.dword))
-        .collect();
-    assert_eq!(marks, [(6, super::ROOT_SRV_VIEW), (7, super::ROOT_VIEW_OFFSET)]);
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: l.dxil,
-        user_data: l.user_data,
-        samplers: l.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: l.root_cbvs,
-        root_srvs: l.root_srvs,
-        root_uavs: l.root_uavs,
-        memory: l.memory,
-        memory_writes: l.memory_writes,
-        view_addresses: l.view_addresses,
-        heap: l.heap,
-        heap_writes: l.heap_writes,
-        view_marks: l.view_marks,
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    if let Some(kind) = root_view {
+        native.layout.push(RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 1,
+        });
+        native.used.push(UsedResource {
+            kind,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 0,
+            slot: 1,
+        });
     }
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let copy: Vec<u32> = (0..256).map(|k| 0x1000 + k).collect();
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
-        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
-        // The table at heap index 0, the copy's view at 1, the root address
-        // 16 bytes into it.
-        (ud[4], ud[6], ud[7]) = (0, 1, 16);
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
-                    views: &[
-                        View::RawUav(32),
-                        View::Buffer {
-                            data: &copy,
-                            stride: super::host::Stride::Raw,
-                        },
-                    ],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: {e}"));
-        let want: Vec<u32> = (0..32).map(|lane| if lane < 16 { 0x1000 + 4 + 16 * lane } else { 0 }).collect();
-        assert_eq!(out[0], want, "{label}");
-        ran += 1;
+    if stride != 0 {
+        native.used.push(UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 1,
+            stride,
+            dwords: 4,
+            user_data: 4,
+            slot: 0,
+        });
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let res = resource::track(&p, &native.layout, native.stage)?;
+    let io = io::raise(&p, &native)?;
+    let st = structure::structure(&p)?;
+    let empty = super::container::build(&[]);
+    emit(&Container::parse(&empty)?, &native, &p, &st, &io, &res, crate::emit::Target::ANY)
 }
 
-/// Writes through unordered buffer views mark their pages (`emit`, "Write
-/// marks"): a dword store and a 16-byte store through view 0 (base bit 100,
-/// its first byte 16 bytes before a 64 KiB page ends, so the second store
-/// crosses into the next page), a store through view 1 (not marked) and an
-/// atomic add through view 2 (base bit 200). The stores land; exactly bits
-/// 100, 101 and 200 are set.
-#[test]
-fn writes_through_views_mark_their_pages() {
-    /// MUBUF `op` of `vdata` at `byte_off` through `s[srsrc:srsrc+3]`.
-    const fn mubuf(op: u32, vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
-        [
-            0x38 << 26 | op << 18 | (byte_off as u32 & 0xFFF),
-            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
-        ]
+#[cfg(windows)]
+fn check(body: &[u32], expected: &[u32], wide_lds: bool, wide_heap: bool) {
+    let shader = shader(body, 1).expect("translate synthetic memory program");
+    check_shader(shader, expected, wide_lds, wide_heap, None, None);
+}
+
+#[cfg(windows)]
+fn check_shader(
+    mut shader: HostShader,
+    expected: &[u32],
+    wide_lds: bool,
+    wide_heap: bool,
+    root_view: Option<super::host::Root>,
+    extra_view: Option<super::host::View<'_>>,
+) {
+    use super::host::{Dispatch, Host, Root, View};
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    let path = super::validator::Validator::default_path();
+    if let Ok(mut validator) = super::validator::Validator::load(path.as_deref()) {
+        validator
+            .validate(&mut shader.dxil)
+            .expect("validate memory DXIL");
+    } else {
+        eprintln!("no dxil.dll; skipped validation");
     }
-    const BUFFER_STORE_DWORDX4: u32 = 0x1E;
-    const BUFFER_ATOMIC_ADD: u32 = 0x32;
-    let mut w = vec![s_mov_b32(5, ZERO as u8)];
-    for (k, sdata) in [8u8, 12, 16].into_iter().enumerate() {
-        w.extend(s_load(2, sdata, 4, 32 * k as u32));
-    }
-    w.push(S_WAITCNT_ALL);
-    w.extend((0..4).map(|v| v_mov_b32(v, 0)));
-    w.extend(buffer_store_dword(0, 8, 0));
-    w.extend(mubuf(BUFFER_STORE_DWORDX4, 0, 8, 12));
-    w.extend(buffer_store_dword(0, 12, 4));
-    w.extend(mubuf(BUFFER_ATOMIC_ADD, 0, 16, 8));
-    w.push(S_ENDPGM);
-    let param = |root, user_data, sgprs, slot| RootParam {
-        root,
-        table_offset_dwords: 0,
-        sgprs,
-        base_register: 0,
-        user_data,
-        slot,
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped dispatch");
+        return;
     };
-    let uav = |k: u32| UsedResource {
-        kind: ResourceType::Uav,
-        root: RootType::Table,
-        table_offset_dwords: 8 * k,
-        lower_bound: k,
-        stride: 0,
-        dwords: 4,
-        user_data: 4,
-        slot: 1,
-    };
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 8,
-        layout: vec![param(RootType::Constants, 0, 4, 0), param(RootType::Table, 4, 1, 1)],
-        used: (0..3).map(uav).collect(),
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1,
-            threads: [1, 1, 1],
-        }),
-        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let l = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        view_marks: true,
-    })
-    .expect("lower");
-    assert!(l.view_marks && !l.memory, "marks without the page table");
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: l.dxil,
-        user_data: l.user_data,
-        samplers: l.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: l.root_cbvs,
-        root_srvs: l.root_srvs,
-        root_uavs: l.root_uavs,
-        memory: l.memory,
-        memory_writes: l.memory_writes,
-        view_addresses: l.view_addresses,
-        heap: l.heap,
-        heap_writes: l.heap_writes,
-        view_marks: l.view_marks,
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
-    }
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let value = 0x1234_5678;
-    let marks = vec![100, 0xFFF0, super::VIEW_MARK_NONE, 0, 200, 0];
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
-        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
-        for u in &shader.user_data {
-            ud[u.index as usize] = if u.root == RootType::Constants { value } else { 0 };
+    let mut options9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+    let mut options11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+    // SAFETY: the out pointers and sizes match the queried feature structs.
+    unsafe {
+        if wide_lds
+            && (host
+                .device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS9,
+                    (&raw mut options9).cast(),
+                    size_of_val(&options9) as u32,
+                )
+                .is_err()
+                || !options9.AtomicInt64OnGroupSharedSupported.as_bool())
+        {
+            eprintln!("no 64-bit groupshared atomics; skipped dispatch");
+            return;
         }
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![
-                        (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: marks.clone() }),
-                        (2, Root::Uav(8)),
-                    ],
-                    views: &[View::RawUav(8), View::RawUav(8), View::RawUav(8)],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: {e}"));
-        assert_eq!(out[0], [value, 0, 0, value, value, value, value, 0], "{label}: view 0");
-        assert_eq!(out[1][1], value, "{label}: view 1");
-        assert_eq!(out[2][2], value, "{label}: the atomic");
-        let marked: Vec<usize> = (0..out[3].len() * 32)
-            .filter(|&b| out[3][b / 32] >> (b % 32) & 1 != 0)
-            .collect();
-        assert_eq!(marked, [100, 101, 200], "{label}: pages");
-        ran += 1;
+        if wide_heap
+            && (host
+                .device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS11,
+                    (&raw mut options11).cast(),
+                    size_of_val(&options11) as u32,
+                )
+                .is_err()
+                || !options11
+                    .AtomicInt64OnDescriptorHeapResourceSupported
+                    .as_bool())
+        {
+            eprintln!("no 64-bit heap atomics; skipped dispatch");
+            return;
+        }
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    let (root, pso) = host.compute_pipeline(&shader).expect("create memory PSO");
+    let mut roots = vec![(
+        0,
+        Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+    )];
+    roots.extend(root_view.map(|view| (1, view)));
+    let mut views = vec![View::RawUav(512 + expected.len() as u32)];
+    views.extend(extra_view);
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots,
+                views: &views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch memory shader");
+    assert_eq!(&out[0][512..], expected);
+}
+
+#[cfg(windows)]
+fn output(body: &mut Vec<u32>, expected: &mut Vec<u32>, reg: u32, value: u32) {
+    body.extend(buf(0x1C, 2048 + 4 * expected.len() as u32, reg, 0));
+    expected.push(value);
+}
+
+#[cfg(windows)]
+#[test]
+fn lds_integer_atomic_updates() {
+    let mut body = Vec::new();
+    let mut expect = Vec::new();
+    mov(&mut body, 0, 0);
+    body.extend(ds(0x14, 0, 0, 0, 0, 0)); // ds_nop
+    for (op, rtn) in [
+        (2, false),
+        (3, false),
+        (4, false),
+        (12, false),
+        (2, true),
+        (3, true),
+        (4, true),
+        (12, true),
+        (0x34, true),
+    ] {
+        for (old, data, data2) in [
+            (0u32, 0u32, 5),
+            (0, 5, 3),
+            (3, 4, 8),
+            (4, 4, 0),
+            (5, 4, 0x8000),
+            (u32::MAX, u32::MAX, 17),
+            (u32::MAX, 0, 1),
+        ] {
+            mov(&mut body, 3, old);
+            mov(&mut body, 4, data);
+            mov(&mut body, 8, data2);
+            body.extend(ds(0x0D, 4, 0, 0, 3, 0));
+            let opcode = if rtn && op != 0x34 { op + 0x20 } else { op };
+            body.extend(ds(opcode, 4, 20, 0, 4, 8));
+            if rtn {
+                output(&mut body, &mut expect, 20, old);
+            }
+            let new = match op {
+                2 => data.wrapping_sub(old),
+                3 => {
+                    if old >= data {
+                        0
+                    } else {
+                        old + 1
+                    }
+                }
+                4 => {
+                    if old == 0 || old > data {
+                        data
+                    } else {
+                        old - 1
+                    }
+                }
+                12 => (old & !data) | data2,
+                0x34 => {
+                    if old >= data {
+                        old - data
+                    } else {
+                        old.wrapping_add(data2)
+                    }
+                }
+                _ => unreachable!(),
+            };
+            body.extend(ds(0x36, 4, 20, 0, 0, 0));
+            output(&mut body, &mut expect, 20, new);
+        }
+    }
+    check(&body, &expect, false, false);
+}
+
+#[cfg(windows)]
+fn mov64(body: &mut Vec<u32>, reg: u32, value: u64) {
+    mov(body, reg, value as u32);
+    mov(body, reg + 1, (value >> 32) as u32);
+}
+
+#[cfg(windows)]
+fn output64(body: &mut Vec<u32>, expected: &mut Vec<u32>, reg: u32, value: u64) {
+    output(body, expected, reg, value as u32);
+    output(body, expected, reg + 1, (value >> 32) as u32);
+}
+
+#[cfg(windows)]
+#[test]
+fn lds_64_bit_atomics_share_the_dword_allocation() {
+    let mut body = Vec::new();
+    let mut expect = Vec::new();
+    mov(&mut body, 0, 0);
+    for op in (0x40..=0x4C).chain([0x50, 0x6D]) {
+        for rtn in [false, true] {
+            if op == 0x6D && !rtn {
+                continue;
+            }
+            let opcode = if rtn && op != 0x6D { op + 0x20 } else { op };
+            for (old, data, data2) in [
+                (0, 0, 3),
+                (0, u64::MAX, 1),
+                (0xFFFF_FFFF, 1, 0),
+                (0x8000_0000_0000_0001, 0x8000_0000_0000_0001, 11),
+                (u64::MAX, 1, 5),
+            ] {
+                mov64(&mut body, 2, old);
+                mov64(&mut body, 4, data);
+                mov64(&mut body, 8, data2);
+                body.extend(ds(0x4D, 8, 0, 0, 2, 0));
+                body.extend(ds(opcode, 8, 20, 0, 4, 8));
+                if rtn {
+                    output64(&mut body, &mut expect, 20, old);
+                }
+                let new = match op {
+                    0x40 => old.wrapping_add(data),
+                    0x41 => old.wrapping_sub(data),
+                    0x42 => data.wrapping_sub(old),
+                    0x43 => {
+                        if old >= data {
+                            0
+                        } else {
+                            old + 1
+                        }
+                    }
+                    0x44 => {
+                        if old == 0 || old > data {
+                            data
+                        } else {
+                            old - 1
+                        }
+                    }
+                    0x45 => (old as i64).min(data as i64) as u64,
+                    0x46 => (old as i64).max(data as i64) as u64,
+                    0x47 => old.min(data),
+                    0x48 => old.max(data),
+                    0x49 => old & data,
+                    0x4A => old | data,
+                    0x4B => old ^ data,
+                    0x4C => (old & !data) | data2,
+                    0x50 => {
+                        if old == data {
+                            data2
+                        } else {
+                            old
+                        }
+                    }
+                    0x6D => data,
+                    _ => unreachable!(),
+                };
+                body.extend(ds(0x76, 8, 20, 0, 0, 0));
+                output64(&mut body, &mut expect, 20, new);
+            }
+        }
+    }
+    // A dword atomic aliases the high half of a qword.
+    mov64(&mut body, 2, 0x8100_0001_AABB_CCDD);
+    body.extend(ds(0x4D, 8, 0, 0, 2, 0));
+    mov(&mut body, 4, 3);
+    body.extend(ds(0x21, 12, 20, 0, 4, 0)); // ds_sub_rtn_u32
+    output(&mut body, &mut expect, 20, 0x8100_0001);
+    body.extend(ds(0x76, 8, 20, 0, 0, 0));
+    output64(&mut body, &mut expect, 20, 0x80FF_FFFE_AABB_CCDD);
+    check(&body, &expect, true, false);
+}
+
+#[cfg(windows)]
+#[test]
+fn lds_paired_exchanges() {
+    for wide in [false, true] {
+        let mut body = Vec::new();
+        let mut expect = Vec::new();
+        mov(&mut body, 0, 0);
+        for strided in [false, true] {
+            let off = if wide { 8 } else { 4 } * if strided { 64 } else { 1 };
+            let store = if wide { 0x4D } else { 0x0D };
+            let load = if wide { 0x76 } else { 0x36 };
+            let op = match (wide, strided) {
+                (false, false) => 0x2E,
+                (false, true) => 0x2F,
+                (true, false) => 0x6E,
+                (true, true) => 0x6F,
+            };
+            let old = [0xABAB_ABAB_0123_4567, 0xCDCD_CDCD_89AB_CDEF];
+            let new = [0x8901_0000_0000_000B, 0x4321_0000_0000_000D];
+            mov64(&mut body, 2, old[0]);
+            mov64(&mut body, 4, old[1]);
+            mov64(&mut body, 6, new[0]);
+            mov64(&mut body, 8, new[1]);
+            body.extend(ds(store, 0, 0, 0, 2, 0));
+            body.extend(ds(store, off, 0, 0, 4, 0));
+            body.extend(ds(op, 1 << 8, 20, 0, 6, 8));
+            if wide {
+                output64(&mut body, &mut expect, 20, old[0]);
+                output64(&mut body, &mut expect, 22, old[1]);
+            } else {
+                output(&mut body, &mut expect, 20, old[0] as u32);
+                output(&mut body, &mut expect, 21, old[1] as u32);
+            }
+            for (address, value) in [(0, new[0]), (off, new[1])] {
+                body.extend(ds(load, address, 20, 0, 0, 0));
+                if wide {
+                    output64(&mut body, &mut expect, 20, value);
+                } else {
+                    output(&mut body, &mut expect, 20, value as u32);
+                }
+            }
+        }
+        check(&body, &expect, wide, false);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn buffer_bytes_and_halves() {
+    let mut body = Vec::new();
+    let mut expect = Vec::new();
+    let mut bytes = [0x47u8, 0x81, 0x19, 0x84, 0xA3, 0x51, 0x08, 0xCC];
+    for (k, &chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+        mov(&mut body, 4, u32::from_le_bytes(chunk));
+        body.extend(buf(0x1C, 4 * k as u32, 4, 0));
+    }
+    let data = 0xB69C_80EDu32;
+    mov(&mut body, 4, data);
+    for (op, at, width, high) in [
+        (0x18, 1, 1, false),
+        (0x1A, 3, 2, false),
+        (0x19, 5, 1, true),
+        (0x1B, 5, 2, true),
+    ] {
+        body.extend(buf(op, at as u32, 4, 0));
+        let source = &data.to_le_bytes()[if high { 2 } else { 0 }..][..width];
+        bytes[at..at + width].copy_from_slice(source);
+    }
+    for (op, width, signed, half) in [
+        (0x08, 1, false, None),
+        (0x09, 1, true, None),
+        (0x0A, 2, false, None),
+        (0x0B, 2, true, None),
+        (0x20, 1, false, Some(0)),
+        (0x21, 1, false, Some(16)),
+        (0x22, 1, true, Some(0)),
+        (0x23, 1, true, Some(16)),
+        (0x24, 2, false, Some(0)),
+        (0x25, 2, false, Some(16)),
+    ] {
+        for at in 1..=5 {
+            let marker = 0x1357_2468;
+            mov(&mut body, 20, marker);
+            // Use VADDR + the immediate offset, including a split short.
+            mov(&mut body, 0, at as u32 - 1);
+            body.extend(buf(op, 1, 20, 1 << 12));
+            let value = match (width, signed) {
+                (1, true) => bytes[at] as i8 as i32 as u32,
+                (1, false) => u32::from(bytes[at]),
+                (2, true) => i16::from_le_bytes([bytes[at], bytes[at + 1]]) as i32 as u32,
+                _ => u32::from(u16::from_le_bytes([bytes[at], bytes[at + 1]])),
+            };
+            let value = half.map_or(value, |shift| {
+                (marker & !(0xFFFF << shift)) | ((value & 0xFFFF) << shift)
+            });
+            output(&mut body, &mut expect, 20, value);
+        }
+    }
+    mov(&mut body, 0, u32::MAX);
+    body.extend(buf(0x1A, 0, 4, 1 << 12)); // a split store must not wrap to byte zero
+    body.extend(buf(0x0A, 0, 20, 1 << 12));
+    output(&mut body, &mut expect, 20, 0);
+    for (k, &chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+        body.extend(buf(0x0C, 4 * k as u32, 20, 0));
+        output(&mut body, &mut expect, 20, u32::from_le_bytes(chunk));
+    }
+    check(&body, &expect, false, false);
+}
+
+#[cfg(windows)]
+#[test]
+fn buffer_integer_atomic_updates() {
+    let mut body = Vec::new();
+    let mut expect = Vec::new();
+    for op in [0x33, 0x34, 0x3C, 0x3D] {
+        for glc in [0, 1 << 14] {
+            if op == 0x34 && glc == 0 {
+                continue;
+            }
+            for (old, data) in [
+                (0u32, 0u32),
+                (0, 5),
+                (3, 4),
+                (4, 4),
+                (5, 4),
+                (u32::MAX, u32::MAX),
+                (u32::MAX, 0),
+            ] {
+                mov(&mut body, 3, old);
+                mov(&mut body, 4, data);
+                body.extend(buf(0x1C, 0, 3, 0));
+                body.extend(buf(op, 0, 4, glc));
+                output(&mut body, &mut expect, 4, if glc == 0 { data } else { old });
+                let new = match op {
+                    0x33 => old.wrapping_sub(data),
+                    0x34 => old.saturating_sub(data),
+                    0x3C => {
+                        if old >= data {
+                            0
+                        } else {
+                            old + 1
+                        }
+                    }
+                    0x3D => {
+                        if old == 0 || old > data {
+                            data
+                        } else {
+                            old - 1
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                body.extend(buf(0x0C, 0, 20, 0));
+                output(&mut body, &mut expect, 20, new);
+            }
+        }
+    }
+    check(&body, &expect, false, false);
+}
+
+#[cfg(windows)]
+#[test]
+fn buffer_64_bit_atomics() {
+    let mut body = Vec::new();
+    let mut expect = Vec::new();
+    for op in (0x50..=0x53).chain(0x55..=0x5D) {
+        for glc in [0, 1 << 14] {
+            for (old, data, compare) in [
+                (0, 0, 1),
+                (0xFFFF_FFFF, 1, 0xFFFF_FFFF),
+                (0x8000_0000_0000_0001, 2, 1),
+                (u64::MAX, 1, u64::MAX),
+            ] {
+                mov64(&mut body, 2, old);
+                mov64(&mut body, 4, data);
+                mov64(&mut body, 6, compare);
+                body.extend(buf(0x1D, 8, 2, 0)); // store_dwordx2
+                body.extend(buf(op, 8, 4, glc));
+                output64(&mut body, &mut expect, 4, if glc == 0 { data } else { old });
+                let new = match op {
+                    0x50 => data,
+                    0x51 => {
+                        if old == compare {
+                            data
+                        } else {
+                            old
+                        }
+                    }
+                    0x52 => old.wrapping_add(data),
+                    0x53 => old.wrapping_sub(data),
+                    0x55 => (old as i64).min(data as i64) as u64,
+                    0x56 => old.min(data),
+                    0x57 => (old as i64).max(data as i64) as u64,
+                    0x58 => old.max(data),
+                    0x59 => old & data,
+                    0x5A => old | data,
+                    0x5B => old ^ data,
+                    0x5C => {
+                        if old >= data {
+                            0
+                        } else {
+                            old + 1
+                        }
+                    }
+                    0x5D => {
+                        if old == 0 || old > data {
+                            data
+                        } else {
+                            old - 1
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                body.extend(buf(0x0D, 8, 20, 0)); // load_dwordx2
+                output64(&mut body, &mut expect, 20, new);
+            }
+        }
+    }
+    check(&body, &expect, false, true);
+}
+
+#[cfg(windows)]
+#[test]
+fn buffer_concurrent_byte_stores() {
+    // Each lane writes its index to a different byte of one output dword.
+    let body = buf(0x18, 2048, 0, 1 << 12);
+    let shader = shader(&body, 4).unwrap();
+    check_shader(shader, &[0x0302_0100], false, false, None, None);
+}
+
+#[cfg(windows)]
+#[test]
+fn structured_buffer_memory_uses_index_and_member_offset() {
+    use super::host::View;
+
+    let mut body = Vec::new();
+    let mut expect = Vec::new();
+    let indexed = |op, off, reg, flags: u32| {
+        let mut words = buf(op, off, reg, flags | (1 << 13));
+        words[1] += 1 << 16; // s[12:15]
+        words
+    };
+    mov(&mut body, 0, 1);
+    mov64(&mut body, 2, 0x1020_3040_ABCD_EF09);
+    body.extend(indexed(0x1D, 0, 2, 0));
+    mov(&mut body, 4, 0x5678);
+    body.extend(indexed(0x1A, 3, 4, 0)); // cross a dword within a record
+    body.extend(indexed(0x0A, 3, 20, 0));
+    output(&mut body, &mut expect, 20, 0x5678);
+    mov(&mut body, 4, 0x9ABC);
+    body.extend(indexed(0x1A, 7, 4, 0)); // short past the end of the member
+    body.extend(indexed(0x0A, 7, 20, 0));
+    output(&mut body, &mut expect, 20, 0);
+    mov(&mut body, 4, 0);
+    body.extend(indexed(0x3C, 4, 4, 1 << 14));
+    output(&mut body, &mut expect, 4, 0x1020_3056);
+    body.extend(indexed(0x0D, 0, 20, 0));
+    output64(&mut body, &mut expect, 20, 0x0000_0000_78CD_EF09);
+    mov(&mut body, 0, 2);
+    mov(&mut body, 4, 7);
+    body.extend(indexed(0x3C, 0, 4, 1 << 14)); // invalid record never enters the CAS loop
+    output(&mut body, &mut expect, 4, 0);
+    let shader = shader_with(&body, 1, None, 8).unwrap();
+    check_shader(
+        shader,
+        &expect,
+        false,
+        false,
+        None,
+        Some(View::StructuredUav(2, 8)),
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn global_and_scalar_loads_through_root_views() {
+    use super::host::Root;
+
+    let mut body = Vec::new();
+    let mut expect = Vec::new();
+    let data: Vec<_> = (0..64)
+        .map(|n| 0x0123_4567u32.wrapping_mul(n + 1))
+        .collect();
+    let bytes: Vec<_> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
+    mov(&mut body, 0, 1);
+    for (op, width, signed, half) in [
+        (0x08, 1, false, None),
+        (0x09, 1, true, None),
+        (0x0A, 2, false, None),
+        (0x0B, 2, true, None),
+        (0x20, 1, false, Some(0)),
+        (0x21, 1, false, Some(16)),
+        (0x22, 1, true, Some(0)),
+        (0x23, 1, true, Some(16)),
+        (0x24, 2, false, Some(0)),
+        (0x25, 2, false, Some(16)),
+    ] {
+        for at in 1..=7 {
+            let marker = 0xDEAD_BEEF;
+            mov(&mut body, 20, marker);
+            // global_load_* v20, v0, s[0:1] offset:(at - 1)
+            body.extend([0xDC00_8000 | op << 18 | (at as u32 - 1), 20 << 24]);
+            let value = match (width, signed) {
+                (1, true) => bytes[at] as i8 as i32 as u32,
+                (1, false) => u32::from(bytes[at]),
+                (2, true) => i16::from_le_bytes([bytes[at], bytes[at + 1]]) as i32 as u32,
+                _ => u32::from(u16::from_le_bytes([bytes[at], bytes[at + 1]])),
+            };
+            let value = half.map_or(value, |shift| {
+                (marker & !(0xFFFF << shift)) | ((value & 0xFFFF) << shift)
+            });
+            output(&mut body, &mut expect, 20, value);
+        }
+    }
+    let scalar_start = body.len();
+    let scalar_output = expect.len();
+    for op in 0..=4 {
+        body.extend([0xF400_0000 | op << 18 | 20 << 6, 0xFA00_000C]);
+        for k in 0..(1 << op) {
+            body.push(0x7E00_0200 | 40 << 17 | (20 + k)); // v_mov_b32 v40, s[20 + k]
+            output(&mut body, &mut expect, 40, data[3 + k as usize]);
+        }
+    }
+    for (kind, body, expect) in [
+        (ResourceType::Srv, &body[..], &expect[..]),
+        (
+            ResourceType::Cbv,
+            &body[scalar_start..],
+            &expect[scalar_output..],
+        ),
+    ] {
+        // The CBV-only fixture uses the same output offsets as the SRV case.
+        let padded;
+        let expect = if kind == ResourceType::Cbv {
+            padded = [vec![0; scalar_output], expect.to_vec()].concat();
+            &padded
+        } else {
+            expect
+        };
+        let shader = shader_with(body, 1, Some(kind), 0).unwrap();
+        let root = Root::View {
+            srv: kind == ResourceType::Srv,
+            data: data.clone(),
+        };
+        check_shader(shader, expect, false, false, Some(root), None);
+    }
+}
+
+#[test]
+#[ignore = "prints the current lowering coverage of the memory opcode tables"]
+fn memory_opcode_refusals() {
+    // One live invocation of each named opcode. Keep every result alive with a
+    // raw store because unused read results can be dropped by the emitter.
+    for encoding in [
+        Encoding::Ds,
+        Encoding::Mubuf,
+        Encoding::Mtbuf,
+        Encoding::Flat,
+        Encoding::Global,
+        Encoding::Scratch,
+        Encoding::Smem,
+    ] {
+        for op in 0..=255 {
+            let Some(name) = gfx10::name(encoding, op) else {
+                continue;
+            };
+            let op = u32::from(op);
+            let cases = match encoding {
+                Encoding::Ds => {
+                    let pair = ["ds_read2", "ds_write2", "ds_wrxchg2"]
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix));
+                    vec![("lds", ds(op, u32::from(pair) << 8, 20, 0, 4, 8))]
+                }
+                Encoding::Mubuf => vec![
+                    (
+                        "raw",
+                        buf(op, 0, 20, u32::from(name.contains("atomic")) << 14),
+                    ),
+                    ("offset", buf(op, 4, 20, 0)),
+                    ("idx?", buf(op, 0, 20, 1 << 13)),
+                    ("indexed", {
+                        let mut words = buf(
+                            op,
+                            0,
+                            20,
+                            1 << 13 | u32::from(name.contains("atomic")) << 14,
+                        );
+                        words[1] += 1 << 16;
+                        words
+                    }),
+                ],
+                Encoding::Mtbuf => [("raw", 0), ("indexed", 1 << 13)]
+                    .map(|(label, flags)| {
+                        (
+                            label,
+                            [
+                                0xE800_0000 | (op & 7) << 16 | 22 << 19 | flags,
+                                0x8002_1400 | (op >> 3) << 21,
+                            ],
+                        )
+                    })
+                    .to_vec(),
+                Encoding::Flat | Encoding::Global | Encoding::Scratch => {
+                    let seg = match encoding {
+                        Encoding::Global => 2,
+                        Encoding::Scratch => 1,
+                        _ => 0,
+                    };
+                    let saddr = if encoding == Encoding::Global {
+                        0
+                    } else {
+                        u32::from(NULL)
+                    };
+                    vec![(
+                        "address",
+                        [
+                            0xDC00_0000 | op << 18 | seg << 14 | 1 << 16,
+                            20 << 24 | saddr << 16 | 4 << 8,
+                        ],
+                    )]
+                }
+                Encoding::Smem => {
+                    let base = if name.starts_with("s_buffer_") { 4 } else { 0 };
+                    vec![(
+                        "scalar",
+                        [0xF400_0000 | op << 18 | 20 << 6 | base, 0xFA00_0000],
+                    )]
+                }
+                _ => unreachable!(),
+            };
+            for (label, words) in cases {
+                let bytes: Vec<_> = words
+                    .into_iter()
+                    .chain([0xBF81_0000])
+                    .flat_map(u32::to_le_bytes)
+                    .collect();
+                let inst = &gfx10::decode(&bytes).unwrap()[0];
+                assert_eq!(inst.name(), Some(name));
+                let mut body = vec![0xBEFE_0380]; // s_mov_b32 m0, 0
+                for reg in 0..32 {
+                    mov(&mut body, reg, 0);
+                }
+                body.extend(words);
+                match inst.fields(false) {
+                    Fields::Ds {
+                        dst: Some(Operand::Vector { dwords, .. }),
+                        ..
+                    }
+                    | Fields::Flat {
+                        dst: Some(Operand::Vector { dwords, .. }),
+                        ..
+                    }
+                    | Fields::Buffer {
+                        data: Some(Operand::Vector { dwords, .. }),
+                        ..
+                    } if name.contains("read")
+                        || name.contains("load")
+                        || name.contains("atomic")
+                        || name.contains("rtn")
+                        || name.starts_with("ds_") =>
+                    {
+                        for k in 0..u32::from(dwords) {
+                            body.extend(buf(0x1C, 2048 + 4 * k, 20 + k, 0));
+                        }
+                    }
+                    Fields::Smem {
+                        data: Some(Operand::Scalar { dwords, .. }),
+                        ..
+                    } if !name.contains("store") => {
+                        for k in 0..u32::from(dwords) {
+                            body.push(0x7E00_0200 | 40 << 17 | (20 + k));
+                            body.extend(buf(0x1C, 2048 + 4 * k, 40, 0));
+                        }
+                    }
+                    _ => {}
+                }
+                let root = matches!(encoding, Encoding::Global | Encoding::Smem)
+                    .then_some(ResourceType::Srv);
+                let stride = if encoding == Encoding::Mubuf && label == "indexed" {
+                    16
+                } else {
+                    0
+                };
+                if let Err(err) = shader_with(&body, 1, root, stride) {
+                    println!("{name:34} {label:8} {err}");
+                }
+            }
+        }
+    }
 }

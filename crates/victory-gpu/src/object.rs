@@ -78,6 +78,37 @@ pub(crate) extern "system" fn release(this: This) -> u32 {
     refs.load(Ordering::Relaxed)
 }
 
+/// A reference to one of our objects, released when dropped.
+pub(crate) struct Ref(This);
+
+// SAFETY: reference counts are atomic, and the objects kept this way
+// (fences, resources) may be used from any thread.
+unsafe impl Send for Ref {}
+
+impl Ref {
+    /// A new reference to `this`, not null.
+    pub(crate) fn new(this: This) -> Ref {
+        add_ref(this);
+        Ref(this)
+    }
+
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+impl Drop for Ref {
+    fn drop(&mut self) {
+        // SAFETY: one of our objects: its first field is its table, whose
+        // third method is `Release`.
+        unsafe {
+            let table = *self.0.cast::<*const *const ()>();
+            let release: extern "system" fn(This) -> u32 = std::mem::transmute(*table.add(2));
+            release(self.0);
+        }
+    }
+}
+
 /// Answers an interface query (or any call handing out an object): a new
 /// reference to `found`, or null and `E_NOINTERFACE`.
 pub(crate) fn answer(kind: usize, iid: *const Iid, found: Option<This>, out: *mut This) -> HRESULT {

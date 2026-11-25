@@ -39,6 +39,26 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Default runtime frame-rate cap (240 Hz OLED target); `VICTORY_FPS=0`
+/// uncaps completely, `VICTORY_FPS=<n>` caps at `<n>`. Tests keep the title's
+/// own interval.
+const DEFAULT_FPS: u32 = 240;
+
+fn fps_override() -> Option<u32> {
+    if cfg!(test) {
+        return None;
+    }
+    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| match std::env::var("VICTORY_FPS") {
+        Ok(v) => v.trim().parse::<u32>().ok().filter(|&n| n > 0),
+        Err(_) => Some(DEFAULT_FPS),
+    })
+}
+
+fn uncapped() -> bool {
+    !cfg!(test) && fps_override().is_none()
+}
+
 /// Device method: a frame every `length` microseconds. The period is how
 /// many intervals a frame may take to reach the display (pipeline depth),
 /// not part of the rate.
@@ -49,11 +69,15 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
-        0 => SIXTIETH,
-        us => Duration::from_micros(u64::from(us)),
+    let interval = if let Some(fps) = fps_override() {
+        Duration::from_nanos(1_000_000_000 / u64::from(fps))
+    } else {
+        match length {
+            0 => SIXTIETH,
+            us => Duration::from_micros(u64::from(us)),
+        }
     };
-    tracing::info!(?interval, "frame interval");
+    tracing::info!(?interval, uncapped = uncapped(), "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -129,16 +153,20 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
-    let limit = Duration::from_millis(u64::from(timeout_ms));
-    // The tick is only logged (diagnostics); taking it is what counts.
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (tick, wait) = next_tick(kind, limit);
-    let hr = if wait > limit {
-        std::thread::sleep(limit);
-        TIMEOUT
+    let (wait, hr) = if uncapped() {
+        last(kind).fetch_add(1, Ordering::Relaxed);
+        (Duration::ZERO, S_OK)
     } else {
-        std::thread::sleep(wait);
-        S_OK
+        let limit = Duration::from_millis(u64::from(timeout_ms));
+        let (_, wait) = next_tick(kind, limit);
+        let hr = if wait > limit {
+            std::thread::sleep(limit);
+            TIMEOUT
+        } else {
+            std::thread::sleep(wait);
+            S_OK
+        };
+        (wait, hr)
     };
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
@@ -155,7 +183,6 @@ pub(crate) extern "system" fn wait(
         timeout_ms,
         flags,
         hr,
-        tick,
         wait_us = wait.as_micros() as u64,
         frame = current(),
         "frame wait"
@@ -210,9 +237,7 @@ mod tests {
         // origin poll that times out (and starts the frame), then a
         // blocking flip wait. Each flip takes its own tick.
         const FLIP: u32 = 2;
-        // 50 ms ticks: a thread woken 15-30 ms late on a busy host (seen with
-        // 5 ms ticks) still makes its tick.
-        assert_eq!(set_interval(null, null, 50_000, 3, 0), S_OK);
+        assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
         let mut token = 0;
         let flips: Vec<u64> = (0..4)
             .map(|_| {

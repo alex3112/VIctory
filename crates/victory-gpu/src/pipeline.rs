@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
+use crate::object::{self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
@@ -61,8 +61,74 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// It animates or draws hair strands ([`hair_strands`]).
+    #[cfg(windows)]
+    hair: bool,
+    /// Its result gets the least indirect light ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+}
+
+/// Whether a container's program is one of those that animate and draw hair
+/// strands, by its name. `VICTORY_HAIR` has them run.
+/// shortcut: left out, as some of them do not translate (an address from a
+/// phi) and the others draw lines all over the screen without them.
+#[cfg(windows)]
+fn hair_strands(container: &[u8]) -> bool {
+    static RUN: OnceLock<bool> = OnceLock::new();
+    const NAMES: [&[u8]; 18] = [
+        b"InterpolateStrand",
+        b"HairStrand",
+        b"CS_VisHair",
+        b"PS_Smh",
+        b"CS_InitSimBuffer",
+        b"CS_PreSkinSim",
+        b"CS_SolvePer",
+        b"CS_WavePerSpline",
+        b"CS_EstimateStartPosition",
+        b"CS_CachePrev",
+        b"CS_RestoreSimVelocity",
+        b"CS_UpdatePosePosition",
+        b"CS_GenerateAccessories",
+        b"CSGenerateHair",
+        b"CS_CalculateFireVolumes",
+        b"CS_ProjDecalCut",
+        b"CS_CullMaskPass",
+        b"CS_LodBlend",
+    ];
+    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some()) {
+        return false;
+    }
+    const END: &[u8] = b"_Wrapped";
+    container
+        .windows(END.len())
+        .enumerate()
+        .filter(|(_, w)| *w == END)
+        .any(|(at, _)| {
+            let before = &container[at.saturating_sub(100)..at];
+            let name = before
+                .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                .next()
+                .unwrap_or_default();
+            NAMES.iter().any(|n| name.windows(n.len()).any(|w| w == *n))
+        })
+}
+
+impl Shader {
+    /// The program's name, if its container tells.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) fn name(&self) -> String {
+        const END: &[u8] = b"_Wrapped";
+        let at = self.container.windows(END.len()).position(|w| w == END);
+        let before = &self.container[at.unwrap_or(0).saturating_sub(100)..at.unwrap_or(0)];
+        let name = before
+            .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+            .next()
+            .unwrap_or_default();
+        String::from_utf8_lossy(name).into_owned()
+    }
 }
 
 impl std::fmt::Debug for Shader {
@@ -74,27 +140,60 @@ impl std::fmt::Debug for Shader {
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
+/// `VICTORY_SHADER_SWAP=<folder>`: a container whose hash (16 digits, as
+/// logged) names a file `<hash>.dxbc` there is replaced by that file's
+/// container, of the same stage and root signature.
+/// shortcut: for the distant trees' wind variants (`VS_Octa*Wind*`), whose
+/// wind volumes nothing fills yet, so that they threw the trees' quads
+/// across the screen; their variants without wind stand in for them.
+fn swapped(hash: &str) -> Option<&'static [u8]> {
+    static SWAPS: OnceLock<HashMap<String, Vec<u8>>> = OnceLock::new();
+    SWAPS
+        .get_or_init(|| {
+            let mut swaps = HashMap::new();
+            let Some(folder) = std::env::var_os("VICTORY_SHADER_SWAP") else { return swaps };
+            for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "dxbc")
+                    && let (Some(name), Ok(bytes)) = (path.file_stem().and_then(|n| n.to_str()), std::fs::read(&path))
+                {
+                    swaps.insert(name.to_owned(), bytes);
+                }
+            }
+            tracing::info!(count = swaps.len(), "shader containers replaced");
+            swaps
+        })
+        .get(hash)
+        .map(Vec::as_slice)
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    let (bytes, full) = match swapped(&full.to_hex()[..16]) {
+        Some(other) => (other, blake3::hash(other)),
+        None => (bytes, full),
+    };
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
-        .or_insert_with(|| Arc::new(Shader::new(stage, bytes)))
+        .or_insert_with(|| {
+            Arc::new(Shader {
+                stage,
+                hash: full.to_hex()[..16].to_owned(),
+                container: bytes.to_vec(),
+                #[cfg(windows)]
+                hair: hair_strands(bytes),
+                #[cfg(windows)]
+                resolves_light: bytes
+                    .windows(crate::ambient::PROGRAM.len())
+                    .any(|w| w == crate::ambient::PROGRAM),
+                #[cfg(windows)]
+                translated: OnceLock::new(),
+            })
+        })
         .clone()
-}
-
-impl Shader {
-    fn new(stage: &'static str, bytes: &[u8]) -> Shader {
-        Shader {
-            stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
-            container: bytes.to_vec(),
-            #[cfg(windows)]
-            translated: OnceLock::new(),
-        }
-    }
 }
 
 /// A translated shader and the console resources its code reads.
@@ -102,39 +201,40 @@ impl Shader {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// Whether the shader indexes `ResourceDescriptorHeap[]` directly.
+    pub(crate) resource_heap: bool,
+    /// Whether the shader may write memory (buffer, image, or global stores
+    /// and atomics); `true` when its code is not known.
+    pub(crate) writes_memory: bool,
 }
 
 #[cfg(windows)]
 impl Shader {
-    /// The translation, made on first use (or taken from the cache); a
-    /// shader that does not translate is logged once.
+    /// The translation, made on first use; a shader that does not
+    /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let (done, cached) = translate(&self.container);
-                let ms = started.elapsed().as_millis() as u64;
-                let (user_ms, kernel_ms) = thread_cpu_since(cpu);
+                let done = translate(&self.container);
+                #[cfg(feature = "diagnostics")]
+                if done.is_err()
+                    || std::env::var("VICTORY_SHADER_HASHES")
+                        .is_ok_and(|l| l.split(',').any(|h| h == self.hash))
+                {
+                    dump(self);
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
-                        cached,
-                        ms,
-                        user_ms,
-                        kernel_ms,
                         "shader translated"
                     ),
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
                         error = %e,
-                        cached,
-                        ms,
-                        user_ms,
-                        kernel_ms,
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
@@ -144,57 +244,87 @@ impl Shader {
     }
 }
 
-/// This thread's processor time so far, user and kernel, in 100 ns units.
-#[cfg(windows)]
-fn thread_cpu() -> (u64, u64) {
-    use windows_sys::Win32::Foundation::FILETIME;
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-    let mut t = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
-    let [created, exited, kernel, user] = &mut t;
-    // SAFETY: four times of our own thread into our own variables.
-    unsafe { GetThreadTimes(GetCurrentThread(), created, exited, kernel, user) };
-    let v = |f: &FILETIME| u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime);
-    (v(user), v(kernel))
-}
-
-/// This thread's processor time since `then` ([`thread_cpu`]): user and
-/// kernel milliseconds. Against the wall time, it tells work from waiting
-/// (for a processor, a lock, the disk).
-#[cfg(windows)]
-fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
-    let now = thread_cpu();
-    ((now.0 - then.0) / 10_000, (now.1 - then.1) / 10_000)
-}
-
-/// The translation, and whether it came from the cache.
-#[cfg(windows)]
-fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(container);
-    (host.and_then(|host| with_resources(container, host)), cached)
-}
-
-#[cfg(windows)]
-fn with_resources(
-    container: &[u8],
-    host: victory_shader::emit::HostShader,
-) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
-    let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
-        Some(part) => victory_shader::native_programs(part.data)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.stage,
-                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
+/// Diagnostics (`VICTORY_SHADER_DUMP=<dir>`, outside the repository): saves
+/// a shader that does not translate, for `victory translate`.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump(shader: &Shader) {
+    let Some(dir) = std::env::var_os("VICTORY_SHADER_DUMP").map(std::path::PathBuf::from) else {
+        return;
     };
-    Ok(Translated { host, used })
+    let path = dir.join(format!("{}-{}.dxbc", shader.stage, shader.hash));
+    if let Err(error) = victory_core::ensure_outside_repo(&path) {
+        tracing::warn!(%error, "shader not saved");
+    } else if let Err(error) = std::fs::write(&path, &shader.container) {
+        tracing::warn!(%error, "shader not saved");
+    }
+}
+
+#[cfg(windows)]
+fn translate(container: &[u8]) -> Result<Translated, String> {
+    use victory_shader::{Container, FourCC, HwStage, RootType};
+    let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
+    let host = crate::shader_cache::host_shader(container, target)?;
+    let dxil_heap = Container::parse(&host.dxil).is_ok_and(|c| {
+        c.part(FourCC::SFI0)
+            .and_then(|p| p.data.get(..8))
+            .is_some_and(|b| {
+                let flags = u64::from_le_bytes(b.try_into().unwrap_or_default());
+                flags & (1 << 32) != 0
+            })
+    });
+    let c = Container::parse(container).map_err(|e| e.to_string())?;
+    let programs = victory_shader::container_programs(&c).unwrap_or_default();
+    let writes_memory = programs.is_empty() || programs.iter().any(writes_memory);
+    let (used, native_heap) = programs
+        .into_iter()
+        .find(|p| {
+            matches!(
+                p.stage,
+                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+            )
+        })
+        .map(|p| {
+            let rh = p.layout.iter().any(|rp| rp.root == RootType::ResourceHeap)
+                || p.used.iter().any(|u| u.root == RootType::ResourceHeap);
+            (p.used, rh)
+        })
+        .unwrap_or_default();
+    Ok(Translated {
+        host,
+        used,
+        resource_heap: dxil_heap || native_heap,
+        writes_memory,
+    })
+}
+
+/// Whether a native program may write memory: it has a buffer, image,
+/// flat, or global store or atomic, or code that is not all known (an
+/// instruction outside our table, an indirect jump, or code that does not
+/// decode).
+#[cfg(windows)]
+fn writes_memory(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Mubuf
+            | Encoding::Mtbuf
+            | Encoding::Mimg
+            | Encoding::Flat
+            | Encoding::Global => name.is_none_or(stores),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a memory instruction (by name) writes memory.
+#[cfg(windows)]
+fn stores(name: &str) -> bool {
+    name.contains("store") || name.contains("atomic")
 }
 
 #[repr(C)]
@@ -286,27 +416,15 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
-    if hashes.is_empty() {
-        return None;
-    }
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| shader.hair || !hashes.is_empty() && hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
-}
-
-/// The shaders of `this`, as host pipelines are named (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn shaders_of(this: This) -> String {
-    if this.is_null() {
-        return "no pipeline".into();
-    }
-    format!("{:?}", pipeline(this).shaders)
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -324,6 +442,15 @@ pub(crate) fn note_drop(this: This) {
     if let Some(why) = why {
         note_why(why);
     }
+}
+
+/// A title pipeline's shaders (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn names(this: This) -> String {
+    if this.is_null() {
+        return "none".into();
+    }
+    pipeline(this).shaders.iter().map(|s| format!("{} {}", s.name(), s.hash)).collect()
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
@@ -346,14 +473,13 @@ pub(crate) fn take_drops() -> Vec<(String, u64)> {
 
 /// The stage's container, if it has one.
 fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
+    if code.code.is_null() || code.size == 0 {
+        return None;
+    }
     // SAFETY: the title passes `size` bytes of shader code.
-    code_of(code).map(|bytes| shader(stage, unsafe { &*bytes }))
-}
-
-/// The bytes a stage's bytecode names, if any.
-fn code_of(code: &Bytecode) -> Option<*const [u8]> {
-    (!code.code.is_null() && code.size != 0)
-        .then(|| std::ptr::slice_from_raw_parts(code.code, code.size))
+    Some(shader(stage, unsafe {
+        std::slice::from_raw_parts(code.code, code.size)
+    }))
 }
 
 fn hand_out(
@@ -411,8 +537,25 @@ pub(crate) extern "system" fn create_compute(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    let shader = copy("compute", &desc.stage);
+    // A container of another compiler's code only (`ACCC`: Grand Theft Auto
+    // VI's upscaler passes) does not run here: the title is told, and does
+    // without (`VICTORY_ACCC=1` takes them, their dispatches are dropped).
+    #[cfg(windows)]
+    if let Some(s) = &shader
+        && victory_shader::Container::parse(&s.container)
+            .is_ok_and(|c| c.part(victory_shader::FourCC::DXIL).is_none())
+        && std::env::var("VICTORY_ACCC").as_deref() == Ok("0")
+    {
+        tracing::warn!(hash = %s.hash, "a compute pipeline without DXIL is not made");
+        if !out.is_null() {
+            // SAFETY: the title's out pointer.
+            unsafe { *out = std::ptr::null() };
+        }
+        return E_NOTIMPL;
+    }
     hand_out(
-        copy("compute", &desc.stage).into_iter().collect(),
+        shader.into_iter().collect(),
         #[cfg(windows)]
         None,
         iid,
@@ -486,37 +629,13 @@ pub(crate) extern "system" fn create_stream(
     if desc.stream.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: the title passes a whole stream.
-    let stream = unsafe { std::slice::from_raw_parts(desc.stream, desc.size) };
-    #[allow(unused_variables)]
-    let (shaders, graphics) = read_stream(stream, copy);
-    hand_out(
-        shaders,
-        #[cfg(windows)]
-        Some(Box::new(graphics)),
-        iid,
-        out,
-    )
-}
-
-#[cfg(windows)]
-type Graphics = host::GraphicsState;
-#[cfg(not(windows))]
-type Graphics = ();
-
-/// A stream's shaders (each made by `shader` from its stage and bytecode)
-/// and graphics state. Its pointers (shader code, input elements) must be
-/// valid: the title's own, or the pre-build's.
-fn read_stream(
-    stream: &[u8],
-    shader: impl Fn(&'static str, &Bytecode) -> Option<Arc<Shader>>,
-) -> (Vec<Arc<Shader>>, Graphics) {
     let mut shaders = Vec::new();
-    #[allow(unused_mut, clippy::let_unit_value)]
-    let mut graphics = Graphics::default();
+    #[cfg(windows)]
+    let mut graphics = host::GraphicsState::default();
     let mut at = 0;
-    while at + 8 <= stream.len() {
-        let kind = u32::from_le_bytes(stream[at..at + 4].try_into().expect("4 bytes"));
+    while at + 8 <= desc.size {
+        // SAFETY: inside the stream the title passes.
+        let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
         let Some((size, stage)) = subobject(kind) else {
             tracing::warn!(
                 kind,
@@ -525,22 +644,25 @@ fn read_stream(
             );
             break;
         };
-        if at + size > stream.len() {
-            break;
-        }
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*stream.as_ptr().add(at + 8).cast::<Bytecode>() };
-            shaders.extend(shader(stage, code));
+            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
+            shaders.extend(copy(stage, code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
         unsafe {
-            graphics.read(kind, stream.as_ptr().add(at))
+            graphics.read(kind, desc.stream.add(at))
         };
         at += size;
     }
-    (shaders, graphics)
+    hand_out(
+        shaders,
+        #[cfg(windows)]
+        Some(Box::new(graphics)),
+        iid,
+        out,
+    )
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -580,107 +702,74 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
-/// The pre-build: a title pipeline made ahead of a run into the pipeline
-/// library (`use_pipeline_cache`), by the code a run makes it with, so the
-/// run finds it there under the same name.
+/// Offline pipelines use the live run's parser, shaders and host library.
 #[cfg(windows)]
 pub struct Prebuild {
     shaders: Vec<Arc<Shader>>,
     graphics: Option<Box<host::GraphicsState>>,
 }
 
-// SAFETY: as `make::Pending`: the graphics state's input elements point
-// into its own names, and it is only read.
+// SAFETY: graphics owns its input-element names; it is only read after construction.
 #[cfg(windows)]
 unsafe impl Send for Prebuild {}
 
 #[cfg(windows)]
 impl Prebuild {
-    /// The pipeline a creation stream describes, as the title passes it to
-    /// the device.
-    ///
     /// # Safety
-    /// The stream's pointers point at live shader code and input elements.
-    pub unsafe fn graphics(stream: &[u8]) -> Prebuild {
-        // Shaders of their own: a pre-build must not keep every container.
-        let own = |stage, code: &Bytecode| {
-            // SAFETY: the caller's pointers.
-            code_of(code).map(|b| Arc::new(Shader::new(stage, unsafe { &*b })))
-        };
-        let (shaders, graphics) = read_stream(stream, own);
-        Prebuild {
-            shaders,
-            graphics: Some(Box::new(graphics)),
+    /// Embedded pointers must name live bytecode and input-element arrays.
+    pub unsafe fn graphics(stream: &[u8]) -> Self {
+        let mut shaders = Vec::new();
+        let mut graphics = host::GraphicsState::default();
+        let mut at = 0;
+        while at + 8 <= stream.len() {
+            let kind = u32::from_le_bytes(stream[at..at + 4].try_into().expect("4"));
+            let Some((size, stage)) = subobject(kind) else { break; };
+            if at + size > stream.len() { break; }
+            if let Some(stage) = stage {
+                // SAFETY: the caller owns the bytecode referenced by this subobject.
+                let code = unsafe { stream.as_ptr().add(at + 8).cast::<Bytecode>().read_unaligned() };
+                shaders.extend(copy(stage, &code));
+            }
+            // SAFETY: complete subobject with pointers guaranteed by the caller.
+            unsafe { graphics.read(kind, stream.as_ptr().add(at)); }
+            at += size;
         }
+        Self { shaders, graphics: Some(Box::new(graphics)) }
     }
 
-    /// The compute pipeline of a container.
-    pub fn compute(container: &[u8]) -> Prebuild {
-        Prebuild {
-            shaders: vec![Arc::new(Shader::new("compute", container))],
-            graphics: None,
-        }
+    pub fn compute(container: &[u8]) -> Self {
+        Self { shaders: vec![shader("compute", container)], graphics: None }
     }
 
-    /// What a run lists the pipeline by (its early list).
     pub fn key(&self) -> String {
-        make::key(&self.shaders, self.graphics.as_deref())
+        let mut key = blake3::Hasher::new();
+        for s in &self.shaders { key.update(s.stage.as_bytes()); key.update(s.hash.as_bytes()); }
+        key.update(self.graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        key.finalize().to_hex()[..32].to_owned()
     }
 
-    /// Its shaders and state as a diagnostics build logs them.
     pub fn describe(&self) -> String {
-        let state = self.graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
-        format!("{:?}\t{state}", self.shaders)
+        format!("{:?}\t{}", self.shaders, self.graphics.as_ref().map(|g| g.describe()).unwrap_or_default())
     }
 
-    /// Makes the host pipeline, or finds it in the library; why not if it
-    /// gets none.
     pub fn make(&self) -> Result<(), String> {
-        let key = self.key();
-        library::keep_early_list();
-        // Without the run's log lines per shader and pipeline: tens of
-        // thousands of them would bury the pre-build's own report.
         let quiet = tracing::Dispatch::none();
-        let made = tracing::dispatcher::with_default(&quiet, || {
-            host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
-        });
-        #[cfg(feature = "diagnostics")]
-        make::log_built(&key);
-        if made.is_some() {
-            // shortcut: a pipeline the library refused to store is listed
-            // too; a run then makes it at first use.
-            library::note_prebuilt(key);
-        }
+        let made = tracing::dispatcher::with_default(&quiet, || host::HostPipeline::new(&self.shaders, self.graphics.as_deref()));
         library::save(false);
-        match made {
-            Some(_) => Ok(()),
-            None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
-                Some(s) => format!("{} shader does not translate", s.stage),
-                None => "the host refuses it".into(),
-            }),
-        }
+        made.map(|_| ()).ok_or_else(|| match self.shaders.iter().find(|s| s.translated().is_none()) {
+            Some(s) => format!("{} shader does not translate", s.stage),
+            None => "the host refuses it".into(),
+        })
     }
 }
 
-/// Host pipelines made, and loaded from the library, since the start.
 #[cfg(windows)]
 pub fn pipeline_counts() -> (u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+    (library::MADE.load(std::sync::atomic::Ordering::Relaxed), library::LOADED.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Whether a pre-build has put the title pipeline `key` in the library
-/// (a second pre-build skips it without translating or loading anything).
 #[cfg(windows)]
-pub fn prebuilt(key: &str) -> bool {
-    library::prebuilt(key)
-}
-
-/// Whether an earlier run drew or dispatched with the title pipeline `key`.
-#[cfg(windows)]
-pub fn wanted_early(key: &str) -> bool {
-    library::wanted_early(key)
-}
+pub fn wanted_early(key: &str) -> bool { library::wanted_early(key) }
 
 #[cfg(test)]
 mod tests {
@@ -800,59 +889,7 @@ mod tests {
             );
         }
     }
-
-    /// The pre-build reads a stream as the title's creation does: the same
-    /// shaders and state, so the same key and the same host pipeline name.
-    #[cfg(windows)]
-    #[test]
-    fn a_prebuild_is_the_pipeline_the_title_creates() {
-        let (vs, ps) = ([7u8; 9], [5u8; 6]);
-        let name = c"TEXCOORD";
-        // One input element: name, index 2, format 16, slot 1, offset 8.
-        let mut element = [0u8; 32];
-        element[..8].copy_from_slice(&(name.as_ptr() as u64).to_le_bytes());
-        for (i, w) in [2u32, 16, 1, 8, 0, 0].iter().enumerate() {
-            element[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
-        }
-        let mut stream = vec![0u8; 0x2b0];
-        let put = |s: &mut Vec<u8>, at: usize, v: u64| {
-            s[at..at + 8].copy_from_slice(&v.to_le_bytes())
-        };
-        let kinds = [(0x10, 1), (0x28, 2), (0x40, 3), (0x58, 4), (0x70, 5), (0x88, 8)];
-        for (at, kind) in kinds.into_iter().chain([(0x210, 21), (0x250, 17)]) {
-            put(&mut stream, at, kind);
-        }
-        put(&mut stream, 0x18, vs.as_ptr() as u64);
-        put(&mut stream, 0x20, vs.len() as u64);
-        put(&mut stream, 0x30, ps.as_ptr() as u64);
-        put(&mut stream, 0x38, ps.len() as u64);
-        put(&mut stream, 0x8c, 1 << 32); // independent blend
-        put(&mut stream, 0x1d8, 9 | 0xffff_ffff << 32);
-        put(&mut stream, 0x1e0, 10 | 3 << 32); // solid fill
-        put(&mut stream, 0x254, 1);
-        put(&mut stream, 0x260, 12);
-        put(&mut stream, 0x268, element.as_ptr() as u64);
-        put(&mut stream, 0x270, 1);
-        put(&mut stream, 0x278, 14 | 4 << 32);
-        put(&mut stream, 0x280, 15 | 87 << 32);
-        put(&mut stream, 0x2a0, 1 << 32);
-        put(&mut stream, 0x2a8, 16 | 40 << 32);
-        let desc = StreamDesc {
-            size: stream.len(),
-            stream: stream.as_ptr(),
-        };
-        let mut p = std::ptr::null();
-        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
-        // SAFETY: the stream points at live code and elements.
-        let pre = unsafe { Prebuild::graphics(&stream) };
-        let title = pipeline(p);
-        assert_eq!(pre.key(), title.host.key);
-        let state = title.host.graphics.as_deref().unwrap().describe();
-        assert!(state.contains(r#"\"TEXCOORD\" 2 16 1 8 0 0"#), "{state}");
-        assert_eq!(pre.describe(), format!("{:?}\t{state}", title.shaders));
-        // Another state is another pipeline.
-        put(&mut stream, 0x1e0, 10 | 2 << 32);
-        // SAFETY: as above.
-        assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
-    }
 }
+
+#[cfg(all(test, windows))]
+mod depth_bounds_test;
