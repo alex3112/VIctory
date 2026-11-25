@@ -15,6 +15,10 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod audit;
+#[cfg(windows)]
+pub use audit::start as start_performance_audit;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]

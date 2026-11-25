@@ -440,7 +440,11 @@ pub(crate) fn note_drop(this: This) {
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
-        note_why(why);
+        if crate::audit::enabled() && !this.is_null() {
+            note_why(format!("{why} | shaders: {}", names(this)));
+        } else {
+            note_why(why);
+        }
     }
 }
 

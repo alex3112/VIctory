@@ -73,7 +73,13 @@ impl Pending {
 
     fn make(&self) {
         // Not `get_or_init`: a worker lost in it would leave it locked.
+        let audit_started = crate::audit::timer();
         let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+        crate::audit::elapsed(crate::audit::C::PipelineBuildUs, audit_started);
+        crate::audit::add(crate::audit::C::PipelineBuilds, 1);
+        if made.is_none() {
+            crate::audit::add(crate::audit::C::PipelineFailed, 1);
+        }
         let _ = self.made.set(made);
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -87,7 +93,8 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None if p.lost.load(Ordering::Relaxed) => Some("pipeline worker lost".into()),
+        None => Some("pipeline pending".into()),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -96,9 +103,9 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 .map(|s| format!("{} {}", s.stage, s.hash))
                 .collect();
             Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
+                format!("pipeline refused {:?}", p.shaders)
             } else {
-                failed.join(" + ")
+                format!("shader translation failed: {}", failed.join(" + "))
             })
         }
     }
@@ -178,7 +185,9 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let us = started.elapsed().as_micros() as u64;
+    waited.fetch_add(us, Ordering::Relaxed);
+    crate::audit::add(crate::audit::C::PipelineWaitUs, us);
 }
 
 /// What the workers take from: the ordinary pipelines, the screen passes.

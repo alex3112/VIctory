@@ -232,6 +232,8 @@ info and above).
 
 ## Debugging
 
+For an opt-in persistent performance report, see [Performance audit](docs/performance-audit.md). Set `VICTORY_AUDIT=1` before launching the game; use a diagnostics build for detailed drop/copy counters.
+
 A release build has no debugging aids. Build them in with
 
 ```powershell

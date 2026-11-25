@@ -456,7 +456,9 @@ impl Host {
                 .and_then(|()| self.fence.SetEventOnCompletion(fence_val, self.event));
             match waited {
                 Ok(()) => {
+                    let wait_started = crate::audit::timer();
                     WaitForSingleObject(self.event, INFINITE);
+                    crate::audit::elapsed(crate::audit::C::FenceWaitUs, wait_started);
                 }
                 Err(e) => tracing::warn!(error = %e, "card GPU wait failed"),
             }
@@ -787,6 +789,9 @@ fn log_gpu_waits() {
         text.push_str(&format!(" {name} ms: {n} x, {:.0} ms;", us as f64 / 1e3));
     }
     tracing::info!("GPU waits since:{text}");
+    if crate::audit::enabled() {
+        crate::audit::emit(format!("submission wall wait distribution since previous report:{text}"));
+    }
     let mut slow: Vec<_> = slow.into_iter().collect();
     slow.sort_unstable_by_key(|(_, (_, us))| std::cmp::Reverse(*us));
     for (key, (n, us)) in slow.into_iter().take(8) {
@@ -812,6 +817,14 @@ fn log_gpu_times() {
     let mut all: Vec<_> = times.into_iter().collect();
     all.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
     tracing::info!("GPU time: {:.1} ms/frame in {} kinds of commands", total / frames, all.len());
+    if crate::audit::enabled() {
+        use std::fmt::Write as _;
+        let mut report = format!("detailed GPU timestamps: frames={frames:.0} measured_ms/frame={:.3} categories={}", total / frames, all.len());
+        for (key, (n, ms)) in all.iter().take(45) {
+            let _ = write!(report, "\n    {:.3} ms/frame {:.2} calls/frame: {key}", ms / frames, f64::from(*n) / frames);
+        }
+        crate::audit::emit(report);
+    }
     for (key, (n, ms)) in all.into_iter().take(45) {
         tracing::info!("GPU time {:7.2} ms/frame, {:7.1} x: {key}", ms / frames, f64::from(n) / frames);
     }
@@ -1125,7 +1138,9 @@ impl Host {
                 if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
                     tracing::warn!(error = %e, "host fence wait failed");
                 } else {
+                    let wait_started = crate::audit::timer();
                     WaitForSingleObject(self.event, INFINITE);
+                    crate::audit::elapsed(crate::audit::C::FenceWaitUs, wait_started);
                 }
             }
         }
@@ -1165,7 +1180,9 @@ impl Host {
                 if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
                     tracing::warn!(error = %e, "host async drain failed");
                 } else {
+                    let wait_started = crate::audit::timer();
                     WaitForSingleObject(self.event, INFINITE);
+                    crate::audit::elapsed(crate::audit::C::FenceWaitUs, wait_started);
                 }
                 SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
@@ -1181,7 +1198,9 @@ impl Host {
         let _inside = crate::profile::here();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        let lock_started = crate::audit::timer();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::audit::elapsed(crate::audit::C::SubmitLockUs, lock_started);
         // Wait for any previous async submission before mutating shared Shadow
         // buffers in `prepare`. During the gap between submissions, the GPU
         // ran in parallel with the title's CPU command-list recording.
@@ -1340,7 +1359,9 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(fence_val, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        let wait_started = crate::audit::timer();
+                    WaitForSingleObject(self.event, INFINITE);
+                    crate::audit::elapsed(crate::audit::C::FenceWaitUs, wait_started);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
@@ -3443,6 +3464,7 @@ struct Presenter {
 struct Meter {
     history: crate::overlay::History,
     last_frame: Option<std::time::Instant>,
+    audit_intervals: Vec<f64>,
     since: std::time::Instant,
     frames: u32,
     drawn: u64,
@@ -3457,6 +3479,7 @@ impl Meter {
         Meter {
             history: crate::overlay::History::default(),
             last_frame: None,
+            audit_intervals: Vec::new(),
             since: now,
             frames: 0,
             drawn: crate::draw::drawn(),
@@ -3469,7 +3492,11 @@ impl Meter {
     fn frame(&mut self, hwnd: HWND) {
         let now = std::time::Instant::now();
         if let Some(previous) = self.last_frame.replace(now) {
-            self.history.push((now - previous).as_secs_f64() * 1000.0);
+            let ms = (now - previous).as_secs_f64() * 1000.0;
+            self.history.push(ms);
+            if crate::audit::enabled() {
+                self.audit_intervals.push(ms);
+            }
         }
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
@@ -3518,6 +3545,39 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        if crate::audit::enabled() {
+            let stats = crate::audit::frame_stats(&mut self.audit_intervals);
+            self.audit_intervals.clear();
+            #[allow(unused_mut)]
+            let mut report = format!(
+                "window frames={} duration_ms={:.1} fps={fps:.3} mean_window_ms={ms:.3} adapter={}\n  {stats}\n  \
+                 cpu_submit_prepare_ms/frame={cpu:.3} gpu_submit_wait_ms/frame={gpu:.3} \
+                 copy_refresh_ms/frame={copy_ms:.3} copy_refresh_MB/frame={copy_mb:.3} \
+                 texture_refresh_ms/frame={texture_ms:.3} texture_read_MB/frame={texture_mb:.3} \
+                 copy_back_ms/frame={back_ms:.3} copy_back_MB/frame={back_mb:.3} \
+                 bindless_plan_ms/frame={plans_ms:.3} bindless_record_ms/frame={records_ms:.3}\n  \
+                 draws_dispatches_recorded/frame={draws:.2} dropped_counter/frame={dropped:.2} \
+                 indirect_counter/frame={indirect:.2} pipelines_pending={} pipelines_made_total={made} \
+                 pipelines_loaded_total={loaded} shader_cache_hits_total={hits} shader_translated_total={translated} \
+                 bindless_backlog_submit={} bindless_backlog_record={}\n  {}\n  {}\n  {}\n  {}",
+                frames, elapsed.as_secs_f64() * 1000.0, adapter_name(), crate::pipeline::making(),
+                crate::descriptor::host::BACKLOG[0].load(Ordering::Relaxed),
+                crate::descriptor::host::BACKLOG[1].load(Ordering::Relaxed),
+                crate::audit::counters(frames), crate::audit::process_memory(), crate::memstat::report(), copy_details,
+            );
+            #[cfg(feature = "diagnostics")]
+            {
+                use std::fmt::Write as _;
+                let _ = write!(report, "\n  drop_reason_count={} (reason counters may overlap)", drops.len());
+                for (reason, count) in drops.iter().take(80) {
+                    let _ = write!(report, "\n    dropped {count}: {reason}");
+                }
+                if drops.len() > 80 {
+                    let _ = write!(report, "\n    {} further reason categories", drops.len() - 80);
+                }
+            }
+            crate::audit::emit(report);
+        }
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -3671,7 +3731,9 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            let present_started = crate::audit::timer();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::audit::elapsed(crate::audit::C::PresentUs, present_started);
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -3753,7 +3815,9 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            let present_started = crate::audit::timer();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::audit::elapsed(crate::audit::C::PresentUs, present_started);
             p.meter.frame(p.hwnd);
         }
         Some(())

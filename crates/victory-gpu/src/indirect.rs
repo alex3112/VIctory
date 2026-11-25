@@ -292,6 +292,10 @@ fn record_clamp(
         None => (src_gpu, 0u32, 0u32),
     };
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
+    if records > 0 {
+        crate::audit::add(crate::audit::C::ClampCalls, 1);
+        crate::audit::add(crate::audit::C::ClampMaxRecords, u64::from(records));
+    }
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -416,6 +420,10 @@ pub(crate) fn bound_before(
     // SAFETY: a live buffer.
     let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
+    if records > 0 {
+        crate::audit::add(crate::audit::C::ClampCalls, 1);
+        crate::audit::add(crate::audit::C::ClampMaxRecords, u64::from(records));
+    }
     let l = &clamps.list;
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, destination (writable: `clamp_room`) and budget buffers. The

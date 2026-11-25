@@ -171,6 +171,9 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(0);
     }
+    if let Err(error) = victory_gpu::start_performance_audit(&cfg.data_dir) {
+        tracing::warn!(%error, "could not start performance audit");
+    }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();

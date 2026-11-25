@@ -171,6 +171,10 @@ fn skip_null_uav_dispatches() -> bool {
 /// Logs, once per pipeline, a dispatch dropped for a null unordered access
 /// view.
 fn null_uav_dropped(pipeline: &str) {
+    #[cfg(feature = "diagnostics")]
+    if crate::audit::enabled() {
+        crate::pipeline::note_why(format!("null UAV: {pipeline}"));
+    }
     static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if seen.len() < 256 && !seen.iter().any(|s| s == pipeline) {
@@ -717,6 +721,10 @@ impl State {
         // set after them.
         let memory = by_address.then(|| self.memory(list, compute)).flatten();
         if by_address && memory.is_none() {
+            #[cfg(feature = "diagnostics")]
+            if crate::audit::enabled() {
+                crate::pipeline::note_why(format!("binding failed: no view of memory: {}", p.name));
+            }
             return no("no view of memory");
         }
         if self.host_heaps != self.heaps && !(by_address && self.heaps[0] == 0) {
@@ -771,6 +779,10 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             let Some(made) = self.tables(list, &t.used, compute) else {
+                #[cfg(feature = "diagnostics")]
+                if crate::audit::enabled() {
+                    crate::pipeline::note_why(format!("binding failed: a table not made: {}", p.name));
+                }
                 return no("a table not made");
             };
             if let Some((param, dwords)) = stage.user_data {
@@ -821,6 +833,10 @@ impl State {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, kind, "a shader reads a root view the title did not set");
+                        #[cfg(feature = "diagnostics")]
+                        if crate::audit::enabled() {
+                            crate::pipeline::note_why(format!("binding failed: a root view not set: {}", p.name));
+                        }
                         return no("a root view not set");
                     };
                     let Some(gpu) = root_view(list, *address, kind) else {
@@ -830,6 +846,10 @@ impl State {
                             address = format_args!("{address:#x}"),
                             "a shader reads a root view outside title buffers"
                         );
+                        #[cfg(feature = "diagnostics")]
+                        if crate::audit::enabled() {
+                            crate::pipeline::note_why(format!("binding failed: a root view outside title buffers: {}", p.name));
+                        }
                         return no("a root view outside title buffers");
                     };
                     // SAFETY: an open list; the address is in live memory.

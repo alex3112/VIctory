@@ -156,6 +156,8 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
+    #[cfg(windows)]
+    let audit_started = crate::audit::timer();
     let (wait, hr) = if uncapped() {
         last(kind).fetch_add(1, Ordering::Relaxed);
         (Duration::ZERO, S_OK)
@@ -171,6 +173,8 @@ pub(crate) extern "system" fn wait(
         };
         (wait, hr)
     };
+    #[cfg(windows)]
+    crate::audit::elapsed(crate::audit::C::FramePaceUs, audit_started);
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.
