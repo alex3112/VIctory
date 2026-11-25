@@ -39,24 +39,27 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Default runtime frame-rate cap (240 Hz OLED target); `VICTORY_FPS=0`
-/// uncaps completely, `VICTORY_FPS=<n>` caps at `<n>`. Tests keep the title's
-/// own interval.
-const DEFAULT_FPS: u32 = 240;
+/// Unset or invalid: respect the title. Zero explicitly uncaps it.
+fn parse_fps(value: Option<&str>) -> (Option<u32>, bool) {
+    match value.and_then(|s| s.trim().parse::<u32>().ok()) {
+        Some(0) => (None, true),
+        Some(n) => (Some(n), false),
+        None => (None, false),
+    }
+}
+
+fn fps_setting() -> (Option<u32>, bool) {
+    if cfg!(test) { return (None, false); }
+    static CAP: std::sync::OnceLock<(Option<u32>, bool)> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| parse_fps(std::env::var("VICTORY_FPS").ok().as_deref()))
+}
 
 fn fps_override() -> Option<u32> {
-    if cfg!(test) {
-        return None;
-    }
-    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| match std::env::var("VICTORY_FPS") {
-        Ok(v) => v.trim().parse::<u32>().ok().filter(|&n| n > 0),
-        Err(_) => Some(DEFAULT_FPS),
-    })
+    fps_setting().0
 }
 
 fn uncapped() -> bool {
-    !cfg!(test) && fps_override().is_none()
+    fps_setting().1
 }
 
 /// Device method: a frame every `length` microseconds. The period is how
@@ -207,6 +210,13 @@ pub(crate) extern "system" fn statistics(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_pacing_respects_the_title_and_uncapping_is_explicit() {
+        assert_eq!(super::parse_fps(None), (None, false));
+        assert_eq!(super::parse_fps(Some("invalid")), (None, false));
+        assert_eq!(super::parse_fps(Some("30")), (Some(30), false));
+        assert_eq!(super::parse_fps(Some(" 0 ")), (None, true));
+    }
     use super::*;
 
     #[test]
