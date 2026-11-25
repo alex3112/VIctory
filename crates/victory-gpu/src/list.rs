@@ -274,6 +274,35 @@ fn hoist(this: This) {
 #[cfg(windows)]
 static PARTED: std::sync::Mutex<Vec<Submitted>> = std::sync::Mutex::new(Vec::new());
 
+/// Drop closed recordings no title list or pending submission owns any
+/// longer. The old spare pool kept their deferred texture/buffer references
+/// indefinitely if recording paused. Keep a small reuse cache; no limit on
+/// allocating live lists. Drop outside PARTED (HostList may wait a fence).
+#[cfg(windows)]
+pub(crate) fn reap_parted() {
+    const IDLE_CACHE: usize = 8;
+    let mut idle = 0;
+    let mut released = Vec::new();
+    {
+        let mut parted = PARTED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut i = 0;
+        while i < parted.len() {
+            if Arc::strong_count(&parted[i].0) == 1 {
+                idle += 1;
+                if idle > IDLE_CACHE {
+                    released.push(parted.swap_remove(i));
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    if !released.is_empty() && crate::audit::enabled() {
+        crate::audit::emit(format!("closed_list_cache_released count={}", released.len()));
+    }
+    drop(released);
+}
+
 /// A host list to record into, open: one that has run, or a new one.
 #[cfg(windows)]
 fn spare() -> Option<Arc<crate::host::HostList>> {

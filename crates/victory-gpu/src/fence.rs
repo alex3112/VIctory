@@ -194,9 +194,8 @@ fn set(this: This, value: u64) {
 /// The CPU's signal: queues may wait for it.
 extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);
-    if crate::timeline::held() {
-        crate::timeline::pump();
-    }
+    // Wake the queue worker even if it has not yet observed the wait.
+    crate::timeline::pump();
     S_OK
 }
 

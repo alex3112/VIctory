@@ -127,7 +127,28 @@ struct Submission {
 #[cfg(windows)]
 impl crate::timeline::Lists for Submission {
     fn ready(&self) -> usize {
-        self.runs.iter().take_while(|l| l.unmet().is_empty()).count()
+        let mut ready = 0;
+        for list in &self.runs {
+            let (waits, writes) = list.memory_sync();
+            // Re-evaluate each list containing waits when it becomes the
+            // queue head, after earlier bottom-of-pipe writes are visible.
+            if ready > 0 && waits || !list.unmet().is_empty() {
+                break;
+            }
+            ready += 1;
+            // Publish a producer's value before preparing unrelated lists.
+            // Timestamp-only writes do not impose this extra boundary.
+            if waits || writes {
+                break;
+            }
+        }
+        ready
+    }
+    fn sync_head(&self) -> bool {
+        self.runs.front().is_some_and(|list| {
+            let (waits, writes) = list.memory_sync();
+            waits || writes
+        })
     }
     fn len(&self) -> usize {
         self.runs.len()
@@ -154,6 +175,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let runs: VecDeque<_> = lists.iter().flat_map(|&l| crate::list::submitted(l)).collect();
+        if runs.is_empty() {
+            return;
+        }
         queue(this)
             .timeline
             .submit(Op::Lists(Box::new(Submission { host, runs })));
@@ -289,6 +313,20 @@ static FRAMES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
+}
+
+/// Resource maintenance clock, not a pretend presented frame. Even during
+/// loading a descriptor plan must be revisited as memory is remapped.
+/// The wall-clock component adds four ticks per second without changing
+/// frame pacing or any actual GPU retirement fence.
+#[cfg(windows)]
+pub(crate) fn resource_epoch() -> u64 {
+    if cfg!(test) {
+        return presented();
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed().as_millis();
+    presented().saturating_add((elapsed / 250) as u64)
 }
 
 /// A frame passes (tests that check per-frame work).

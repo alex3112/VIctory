@@ -82,3 +82,29 @@ compiler crash history. The first run rebuilds this library. No mip limit,
 shader policy, GPU timeout or experimental sparse-tile sweep default is changed.
 
 Windows validation and gameplay measurements are still required.
+
+## Resource Lifetime & Queue Synchronization (audit v3)
+
+Windows production builds use a dedicated title queue worker by default. Each
+ready queue advances one operation per round; fence signals and page/present
+work remain ordered after preceding submissions and copy-back. Host D3D12
+submission remains serialized. `VICTORY_QUEUE_WORKER=0` restores inline
+execution. The worker does not bypass unmet waits by default; the old timeout
+fallback can be explicitly requested with `VICTORY_FORCE_WAITS=1` for diagnosis.
+The audit reports pending operations, busy and held queues, completed steps
+and forced waits independently of presentation. The queue can still be stalled
+by expensive preparation of a single submission or a genuinely missing write.
+
+Aligned memory waits use acquire loads, and already-published early writes
+are no longer treated as hypothetical values. Bindless plans are refreshed
+per heap on a maintenance epoch that advances during loading, not just when
+an image is presented. Shader write-range deduplication and copy-back grouping
+use hashed keys instead of repeated linear scans.
+
+Completed, unreferenced closed lists are trimmed from the spare pool.
+Upload-only staging (explicitly Arc-owned by lists and submissions) is retired
+after observed host fence completion, independently of presentation. Generic
+texture/descriptor retirement retains its existing safety grace period; no
+unsafe eviction of live descriptors or sparse memory is enabled. Windows build
+and title runtime validation are required. No game executable patch, watchdog
+bypass, shader disablement or quality changes are introduced.

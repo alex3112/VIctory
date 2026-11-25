@@ -30,10 +30,18 @@ impl Wait {
         if self.address < 0x10000 {
             return 0;
         }
-        // SAFETY: the title names readable GPU memory (unified with ours).
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+        // SAFETY: title memory is readable; aligned synchronization words
+        // pair with the release stores in queue::Written::write.
         unsafe {
             if self.bytes == 4 {
-                u64::from((self.address as *const u32).read_unaligned())
+                if self.address.is_multiple_of(align_of::<AtomicU32>()) {
+                    u64::from((*(self.address as *const AtomicU32)).load(Ordering::Acquire))
+                } else {
+                    u64::from((self.address as *const u32).read_unaligned())
+                }
+            } else if self.address.is_multiple_of(align_of::<AtomicU64>()) {
+                (*(self.address as *const AtomicU64)).load(Ordering::Acquire)
             } else {
                 (self.address as *const u64).read_unaligned()
             }
@@ -44,6 +52,19 @@ impl Wait {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aligned_waits_read_the_full_requested_width() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let word = AtomicU64::new(0x1234_5678_9abc_def0);
+        let address = &word as *const AtomicU64 as usize;
+        let wait = Wait { address, comparison: 3, reference: 0, bytes: 4 };
+        assert_eq!(wait.value(), 0x9abc_def0);
+        let wait = Wait { bytes: 8, ..wait };
+        assert_eq!(wait.value(), 0x1234_5678_9abc_def0);
+        word.store(42, Ordering::Release);
+        assert_eq!(wait.value(), 42);
+    }
 
     #[test]
     fn waits_compare_as_asked() {

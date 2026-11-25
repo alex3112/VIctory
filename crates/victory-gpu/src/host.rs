@@ -119,6 +119,12 @@ static RETIRED: Mutex<std::collections::VecDeque<Retired>> =
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A completed submission whose actual D3D12 fence was observed.
+static SAFE_FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Upload-only staging has no descriptor-visible raw resource references.
+/// Deferred copies and asynchronous submissions own its Arc until done.
+static RETIRED_UPLOADS: Mutex<std::collections::VecDeque<Retired>> =
+    Mutex::new(std::collections::VecDeque::new());
 
 /// Presented host frames a retired object is also kept for. Worker threads
 /// record lists ahead of submission and a title frame spans many
@@ -155,8 +161,26 @@ pub(crate) fn retire<T: 'static>(object: T) {
     crate::memstat::add(&crate::memstat::RETIRED_COUNT, 1);
 }
 
+/// A staging upload's last Arc is gone. Only actual submitted GPU work can
+/// still need the upload, so the ordinary 32-present descriptor grace
+/// period is unnecessary. Do not use this for textures or descriptor slots.
+pub(crate) fn retire_upload<T: 'static>(object: T) {
+    let mut retired = RETIRED_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+    retired.push_back(Retired {
+        submission: STARTED.load(Ordering::Acquire),
+        frame: 0,
+        object: Box::new(object),
+    });
+    crate::memstat::add(&crate::memstat::RETIRED_COUNT, 1);
+}
+
+/// Called outside submission locks by the queue worker.
+pub(crate) fn collect_retired() {
+    bury(FINISHED.load(Ordering::Acquire));
+}
+
 /// Drops what waited for submissions up to `finished` and is old enough
-/// in presented frames.
+/// in presented frames; upload-only staging needs a verified fence only.
 fn bury(finished: u64) {
     // Diagnostics (`VICTORY_KEEP_RETIRED`): nothing is freed, to tell a use
     // after free from a wild address.
@@ -177,6 +201,14 @@ fn bury(finished: u64) {
         retired.drain(..n).collect()
     };
     drop(done);
+    let safe = SAFE_FINISHED.load(Ordering::Acquire);
+    let uploads: Vec<Retired> = {
+        let mut retired = RETIRED_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        let n = retired.iter().take_while(|r| r.submission <= safe).count();
+        crate::memstat::sub(&crate::memstat::RETIRED_COUNT, n as u64);
+        retired.drain(..n).collect()
+    };
+    drop(uploads);
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -495,7 +527,11 @@ impl Host {
                     WaitForSingleObject(self.event, INFINITE);
                     crate::audit::elapsed(crate::audit::C::FenceWaitUs, wait_started);
                 }
-                Err(e) => tracing::warn!(error = %e, "card GPU wait failed"),
+                Err(e) => fail(format_args!("card GPU wait failed: {e}")),
+            }
+            let completed = self.fence.GetCompletedValue();
+            if completed < fence_val || completed == u64::MAX {
+                fail(format_args!("card GPU fence {fence_val} incomplete ({completed})"));
             }
         }
     }
@@ -1005,6 +1041,8 @@ struct Deferred {
     marks: Vec<usize>,
     /// How many of `writes` this submission has done already.
     early: usize,
+    /// Zero-work waits already observed in order by the queue scheduler.
+    early_waits: usize,
     wait_marks: Vec<usize>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
@@ -1140,6 +1178,10 @@ impl Host {
     fn reap_completed(&self) {
         // SAFETY: a plain fence query.
         let completed = unsafe { self.fence.GetCompletedValue() };
+        // UINT64_MAX denotes device removal, not fence completion.
+        if completed == u64::MAX {
+            fail(format_args!("host device removed while reaping asynchronous submissions"));
+        }
         let mut last_sub = 0u64;
         loop {
             let done = {
@@ -1166,6 +1208,7 @@ impl Host {
         }
         if last_sub != 0 {
             FINISHED.fetch_max(last_sub, Ordering::AcqRel);
+            SAFE_FINISHED.fetch_max(last_sub, Ordering::AcqRel);
             bury(last_sub);
         }
     }
@@ -1333,6 +1376,7 @@ impl Host {
         let mut card_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
             Vec::new();
         let mut cpu_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let mut write_ranges = std::collections::HashSet::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step {
@@ -1341,9 +1385,7 @@ impl Host {
                     } else {
                         &mut cpu_back
                     };
-                    if !target.iter().any(|(s, a, l)| {
-                        std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
-                    }) {
+                    if write_ranges.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len)) {
                         target.push((shadow.clone(), *address, *len));
                     }
                 }
@@ -1355,9 +1397,7 @@ impl Host {
             } else {
                 &mut cpu_back
             };
-            if !target.iter().any(|(s, a, l)| {
-                std::sync::Arc::ptr_eq(s, &shadow) && (*a, *l) == (address, len)
-            }) {
+            if write_ranges.insert((std::sync::Arc::as_ptr(&shadow) as usize, address, len)) {
                 target.push((shadow, address, len));
             }
         }
@@ -1435,7 +1475,7 @@ impl Host {
             if can_async {
                 // SAFETY: the fence is ours.
                 if let Err(e) = unsafe { self.queue.Signal(&self.fence, fence_val) } {
-                    tracing::warn!(error = %e, "host async submission not signalled");
+                    fail(format_args!("host async submission not signalled: {e}{}", self.removal_data(runs)));
                 } else {
                     for list in runs {
                         list.last_fence.store(fence_val, Ordering::Release);
@@ -1456,7 +1496,11 @@ impl Host {
                     WaitForSingleObject(self.event, INFINITE);
                     crate::audit::elapsed(crate::audit::C::FenceWaitUs, wait_started);
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => fail(format_args!("host submission not waited for: {e}{}", self.removal_data(runs))),
+                }
+                let completed = self.fence.GetCompletedValue();
+                if completed < fence_val || completed == u64::MAX {
+                    fail(format_args!("host fence {fence_val} incomplete ({completed}){}", self.removal_data(runs)));
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1509,8 +1553,6 @@ impl Host {
             return;
         }
         drop(early);
-        FINISHED.fetch_max(this_submission, Ordering::AcqRel);
-        bury(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1553,6 +1595,20 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.finish_submission(runs, cpu_back);
+        // Never recycle upload memory on the basis of a failed host wait.
+        // A subsequent successful fence covers all earlier queue work.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if !groups.is_empty() && completed != u64::MAX && completed >= *submitted {
+            #[cfg(feature = "diagnostics")]
+            let executed = !no_work();
+            #[cfg(not(feature = "diagnostics"))]
+            let executed = true;
+            if executed {
+                SAFE_FINISHED.fetch_max(this_submission, Ordering::AcqRel);
+            }
+        }
+        FINISHED.fetch_max(this_submission, Ordering::AcqRel);
+        bury(this_submission);
         self.log_messages();
     }
 
@@ -1575,15 +1631,14 @@ impl Host {
             // across CPU cores without lock contention on `before`/`pending`.
             let mut groups: Vec<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>> =
                 Vec::new();
+            let mut indices = std::collections::HashMap::new();
             for item in back {
-                if let Some(g) = groups
-                    .iter_mut()
-                    .find(|g| std::sync::Arc::ptr_eq(&g[0].0, &item.0))
-                {
-                    g.push(item);
-                } else {
-                    groups.push(vec![item]);
-                }
+                let key = std::sync::Arc::as_ptr(&item.0) as usize;
+                let index = *indices.entry(key).or_insert_with(|| {
+                    groups.push(Vec::new());
+                    groups.len() - 1
+                });
+                groups[index].push(item);
             }
             if groups.len() <= 1 {
                 for (shadow, address, len) in &groups[0] {
@@ -1640,6 +1695,7 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
             deferred.early = 0;
+            deferred.early_waits = 0;
         }
     }
 
@@ -2336,9 +2392,9 @@ impl HostList {
         for (i, (at, what, _)) in deferred.writes.iter().enumerate() {
             events.push((i, 1, format!("W[{at:x}]={what:x?}@{}", deferred.marks.get(i).copied().unwrap_or(0))));
         }
-        for (before, w) in &deferred.waits {
-            let mark = deferred.wait_marks.get(events.len().saturating_sub(deferred.writes.len())).copied().unwrap_or(0);
-            events.push((*before, 0, format!("R[{:x}]>={:x}@{mark}", w.address, w.reference)));
+        for (i, (before, w)) in deferred.waits.iter().enumerate() {
+            let mark = deferred.wait_marks.get(i).copied().unwrap_or(0);
+            events.push((*before, 0, format!("R[{:x}] cmp={} ref={:x} bytes={} @{mark}", w.address, w.comparison, w.reference, w.bytes)));
         }
         events.sort_by_key(|e| (e.0, e.1));
         let work = *self.work.lock().unwrap_or_else(|e| e.into_inner());
@@ -2444,21 +2500,38 @@ impl HostList {
     /// work of the list precedes them; whether there were any.
     pub(crate) fn write_early(&self) -> bool {
         let mut deferred = self.deferred();
-        let first = deferred.waits.iter().find(|(_, wait)| !wait.met(wait.value()));
-        let Some(&(before, _)) = first else {
-            return false;
-        };
-        let done = deferred.early;
-        // Those before any work (marks only grow).
-        let before = before.min(deferred.marks.iter().take_while(|&&m| m == 0).count());
-        if before <= done {
-            return false;
+        let mut done = deferred.early;
+        let mut waited = deferred.early_waits;
+        let initial = (done, waited);
+        let zero_work = deferred.marks.iter().take_while(|&&m| m == 0).count();
+        // Publish only the zero-work prefix before each wait, in order.
+        // Never write past a preceding unmet wait or past actual GPU work.
+        for (i, &(before, wait)) in deferred.waits.iter().enumerate().skip(waited) {
+            if deferred.wait_marks.get(i).copied().unwrap_or(1) != 0 || before > zero_work {
+                break;
+            }
+            if before > done {
+                for &(at, what, bytes) in &deferred.writes[done..before] {
+                    what.write(at as *mut u8, bytes);
+                }
+                done = before;
+            }
+            if !wait.met(wait.value()) {
+                break;
+            }
+            // A wait once passed is not required to stay true forever.
+            waited = i + 1;
         }
-        for &(at, what, bytes) in &deferred.writes[done..before] {
-            what.write(at as *mut u8, bytes);
-        }
-        deferred.early = before;
-        true
+        deferred.early = done;
+        deferred.early_waits = waited;
+        (done, waited) != initial
+    }
+
+    /// Memory synchronization boundaries (excluding profiling timestamps).
+    pub(crate) fn memory_sync(&self) -> (bool, bool) {
+        let deferred = self.deferred();
+        (!deferred.waits.is_empty(), deferred.writes.iter().any(|(_, what, _)|
+            matches!(what, crate::queue::Written::Value(_))))
     }
 
     /// The waits of the list that are not met yet, apart from those its own
@@ -2468,13 +2541,19 @@ impl HostList {
         deferred
             .waits
             .iter()
+            .skip(deferred.early_waits)
             .filter(|(before, wait)| {
-                let own = deferred.writes[..*before]
+                // A write already published by write_early is no longer
+                // a prediction: another queue may have changed that word.
+                // Read the live value instead of replaying our old write.
+                let own = deferred.writes[deferred.early.min(*before)..*before]
                     .iter()
                     .rev()
                     .find(|w| w.0 == wait.address);
                 match own {
-                    Some((_, crate::queue::Written::Value(v), _)) => !wait.met(*v),
+                    Some((_, crate::queue::Written::Value(v), bytes)) if *bytes >= wait.bytes => {
+                        !wait.met(if wait.bytes == 4 { u64::from(*v as u32) } else { *v })
+                    }
                     _ => !wait.met(wait.value()),
                 }
             })

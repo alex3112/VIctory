@@ -2,14 +2,15 @@
 //! back behind a wait (for a fence, or for a value a list waits for in
 //! memory) until that is met.
 //!
-//! Work runs on the thread that submits it, as long as nothing holds the
-//! queue back; else the submission returns, and the work runs on the thread
-//! that meets the wait. One title thread submits to all queues, waits before
-//! what they wait for, so a submission never blocks.
+//! Production Windows queues are pumped by one host worker, not by the
+//! title thread that enqueues commands. The host device already serializes
+//! its submissions. Ready operations advance round-robin across timelines;
+//! no fence signal is published before its preceding work completes.
+//! VICTORY_QUEUE_WORKER=0 restores the original inline execution path.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::fence::Held;
@@ -20,6 +21,10 @@ pub(crate) trait Lists: Send {
     /// an earlier one writes counts once that ran).
     fn ready(&self) -> usize;
     fn len(&self) -> usize;
+    /// A synchronization boundary must observe previous asynchronous work.
+    fn sync_head(&self) -> bool {
+        false
+    }
     /// Writes what the first, not ready, writes before its wait, if it does
     /// no work before that; whether it wrote anything. Two queues may meet
     /// this way halfway through a list each.
@@ -59,6 +64,70 @@ struct State {
 static QUEUES: Mutex<Vec<Arc<Timeline>>> = Mutex::new(Vec::new());
 /// How many queues are held back.
 static HELD: AtomicU64 = AtomicU64::new(0);
+static ENQUEUED: AtomicU64 = AtomicU64::new(0);
+static DEQUEUED: AtomicU64 = AtomicU64::new(0);
+static RUNNING: AtomicU64 = AtomicU64::new(0);
+static STEPS: AtomicU64 = AtomicU64::new(0);
+static FORCED: AtomicU64 = AtomicU64::new(0);
+
+/// Lock-free diagnostics: safe even when the worker is stuck in D3D12.
+#[cfg(windows)]
+pub(crate) fn audit_state() -> String {
+    format!("queue_pending={} queue_busy={} queue_held={} queue_steps={} queue_forced={}",
+        ENQUEUED.load(Ordering::Relaxed).saturating_sub(DEQUEUED.load(Ordering::Relaxed)),
+        RUNNING.load(Ordering::Relaxed), HELD.load(Ordering::Relaxed),
+        STEPS.load(Ordering::Relaxed), FORCED.load(Ordering::Relaxed))
+}
+
+/// The single host queue worker. Tests preserve synchronous calls, as do
+/// non-Windows hosts. Failure to spawn leaves the inline scheduler available.
+fn worker() -> Option<&'static std::thread::Thread> {
+    static WORKER: OnceLock<Option<std::thread::Thread>> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        if !cfg!(windows) || cfg!(test)
+            || std::env::var("VICTORY_QUEUE_WORKER").is_ok_and(|v| v == "0")
+        {
+            return None;
+        }
+        match std::thread::Builder::new().name("victory-queue-worker".into()).spawn(|| {
+            let mut maintenance = Instant::now();
+            loop {
+                let moved = pump_round();
+                crate::fence::wake();
+                if !moved && held() {
+                    force();
+                }
+                #[cfg(windows)]
+                if maintenance.elapsed() >= Duration::from_millis(250) {
+                    crate::list::reap_parted();
+                    crate::host::collect_retired();
+                    maintenance = Instant::now();
+                }
+                #[cfg(not(windows))]
+                let _ = &mut maintenance;
+                if moved {
+                    continue;
+                }
+                // unpark is a retained permit: notifications between the
+                // last empty check and park cannot be lost.
+                std::thread::park_timeout(if held() {
+                    Duration::from_millis(1)
+                } else {
+                    Duration::from_millis(10)
+                });
+            }
+        }) {
+            Ok(join) => {
+                tracing::info!("dedicated title queue worker enabled");
+                Some(join.thread().clone())
+            }
+            Err(error) => {
+                tracing::warn!(%error, "queue worker unavailable; using inline scheduler");
+                None
+            }
+        }
+    }).as_ref()
+}
 
 /// How long queues may be held back while none of them moves. A wait whose
 /// value only comes from later work of the same list, or from work that was
@@ -102,7 +171,11 @@ impl Timeline {
 
     /// Adds work to the queue and runs what can run, on every queue.
     pub(crate) fn submit(&self, op: Op) {
-        self.lock().ops.push_back(op);
+        {
+            let mut state = self.lock();
+            state.ops.push_back(op);
+            ENQUEUED.fetch_add(1, Ordering::Relaxed);
+        }
         pump();
     }
 
@@ -114,59 +187,60 @@ impl Timeline {
 
     /// Runs what can run on this queue; whether anything did. `force`: the
     /// first op runs whether or not its wait is met.
-    fn step(&self, mut force: bool) -> bool {
-        let mut moved = false;
-        loop {
-            let mut s = self.lock();
-            if s.busy {
-                return moved;
+    fn step(&self, force: bool) -> bool {
+        let mut s = self.lock();
+        if s.busy {
+            return false;
+        }
+        let work: Box<dyn FnOnce()> = match s.ops.front_mut() {
+            None => {
+                s.hold(false);
+                return false;
             }
-            let work: Box<dyn FnOnce()> = match s.ops.front_mut() {
-                None => {
-                    s.hold(false);
-                    return moved;
-                }
-                Some(Op::Wait(fence, value)) => {
-                    if !fence.reached(*value) && !force {
-                        // What it waits for may be what an unwaited
-                        // submission still owes (its bottom-of-pipe writes):
-                        // that one is finished first, then this is looked
-                        // at again. Without this the queue stood until the
-                        // wait was forced, two seconds a frame.
-                        if !finishing() {
-                            s.hold(true);
-                            return moved;
-                        }
-                        Box::new(finish)
-                    } else {
-                        let op = s.ops.pop_front();
-                        Box::new(move || drop(op))
+            Some(Op::Wait(fence, value)) => {
+                if !fence.reached(*value) && !force {
+                    if !finishing() {
+                        s.hold(true);
+                        return false;
                     }
+                    Box::new(finish)
+                } else {
+                    let op = s.ops.pop_front();
+                    DEQUEUED.fetch_add(1, Ordering::Relaxed);
+                    Box::new(move || drop(op))
                 }
-                Some(Op::Lists(lists)) => {
+            }
+            Some(Op::Lists(lists)) => {
+                if !force && lists.sync_head() && finishing() {
+                    Box::new(finish)
+                } else {
+                    if !force && lists.early() {
+                        progress();
+                        STEPS.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
                     let (ready, len) = (lists.ready(), lists.len());
                     let n = if force { ready.max(1) } else { ready }.min(len);
                     if n == 0 && len > 0 {
-                        if lists.early() {
-                            progress();
-                            moved = true;
-                            continue;
-                        }
-                        // As for a fence above.
                         if !finishing() {
                             s.hold(true);
-                            return moved;
+                            return false;
                         }
                         Box::new(finish)
                     } else {
                         let work = lists.take(n);
                         if n == len {
                             s.ops.pop_front();
+                            DEQUEUED.fetch_add(1, Ordering::Relaxed);
                         }
                         work
                     }
                 }
-                Some(Op::Signal(..) | Op::Work(_)) => match s.ops.pop_front() {
+            }
+            Some(Op::Signal(..) | Op::Work(_)) => {
+                let op = s.ops.pop_front();
+                DEQUEUED.fetch_add(1, Ordering::Relaxed);
+                match op {
                     Some(Op::Signal(fence, value)) => Box::new(move || {
                         #[cfg(windows)]
                         crate::host::wait_in_flight_if_ready();
@@ -177,17 +251,22 @@ impl Timeline {
                         crate::host::wait_in_flight_if_ready();
                         work();
                     }),
-                    _ => return moved,
-                },
-            };
-            s.hold(false);
-            s.busy = true;
-            drop(s);
-            work();
-            self.lock().busy = false;
-            progress();
-            (moved, force) = (true, false);
-        }
+                    _ => return false,
+                }
+            }
+        };
+        s.hold(false);
+        s.busy = true;
+        RUNNING.fetch_add(1, Ordering::Relaxed);
+        drop(s);
+        work();
+        self.lock().busy = false;
+        RUNNING.fetch_sub(1, Ordering::Relaxed);
+        STEPS.fetch_add(1, Ordering::Relaxed);
+        progress();
+        // A single operation per pass: another queue may be waiting for a
+        // signal that is ready now. Do not drain this queue ahead of it.
+        true
     }
 }
 
@@ -221,22 +300,32 @@ fn queues() -> MutexGuard<'static, Vec<Arc<Timeline>>> {
 /// Runs what can run on every queue, until none moves: what one ran may be
 /// what another waits for.
 pub(crate) fn pump() {
-    loop {
-        // Queues the title released go once they have run everything.
-        let all = {
-            let mut queues = queues();
-            queues.retain(|q| Arc::strong_count(q) > 1 || !q.idle());
-            queues.clone()
-        };
-        let mut moved = false;
-        for queue in &all {
-            moved |= queue.step(false);
-        }
-        if !moved {
-            return;
-        }
+    if let Some(thread) = worker() {
+        thread.unpark();
+    } else {
+        pump_inline();
+    }
+}
+
+fn pump_inline() {
+    while pump_round() {
         crate::fence::wake();
     }
+}
+
+/// Single round, so maintenance and fence event notification cannot be
+/// starved by a continuously replenished queue.
+fn pump_round() -> bool {
+    let all = {
+        let mut queues = queues();
+        queues.retain(|q| Arc::strong_count(q) > 1 || !q.idle());
+        queues.clone()
+    };
+    let mut moved = false;
+    for queue in &all {
+        moved |= queue.step(false);
+    }
+    moved
 }
 
 /// When a queue last ran something.
@@ -249,6 +338,9 @@ fn progress() {
 /// Starts the thread that looks at what holds queues back: values the CPU
 /// writes to memory wake nothing.
 fn watch() {
+    if worker().is_some() {
+        return;
+    }
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::Relaxed) {
         return;
@@ -288,7 +380,28 @@ fn force() {
     let Some((since, queue)) = oldest.filter(|(since, _)| since.elapsed() > LIMIT) else {
         return;
     };
-    static FORCED: AtomicU64 = AtomicU64::new(0);
+    // Do not silently skip a real dependency in worker mode. The legacy
+    // escape hatch remains explicit for debugging titles with missing writes.
+    let allow_force = worker().is_none()
+        || std::env::var("VICTORY_FORCE_WAITS").is_ok_and(|v| v == "1");
+    if !allow_force {
+        static LAST_REPORT: Mutex<Option<Instant>> = Mutex::new(None);
+        let mut last = LAST_REPORT.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) {
+            *last = Some(Instant::now());
+            let waits = match queue.lock().ops.front() {
+                Some(Op::Lists(lists)) => lists.waits(),
+                Some(Op::Wait(_, value)) => format!("fence >= {value}"),
+                _ => String::new(),
+            };
+            tracing::warn!(ms = since.elapsed().as_millis(), %waits, "queue dependency still unmet (not bypassed)");
+            #[cfg(windows)]
+            if crate::audit::enabled() {
+                crate::audit::emit(format!("queue_dependency_unmet ms={} waits={waits}", since.elapsed().as_millis()));
+            }
+        }
+        return;
+    }
     let forced = FORCED.fetch_add(1, Ordering::Relaxed) + 1;
     if forced <= 32 || forced.is_power_of_two() {
         let waits = match queue.lock().ops.front() {
@@ -369,6 +482,25 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(20), "still held back");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn a_ready_queue_advances_only_one_operation_per_round() {
+        let queue = Timeline::default();
+        let at = Arc::new(AtomicU64::new(0));
+        for value in [1, 2] {
+            let at = at.clone();
+            queue.lock().ops.push_back(Op::Work(Box::new(move || {
+                at.store(value, Ordering::Release);
+            })));
+            ENQUEUED.fetch_add(1, Ordering::Relaxed);
+        }
+        assert!(queue.step(false));
+        assert_eq!(at.load(Ordering::Acquire), 1);
+        assert!(!queue.idle());
+        assert!(queue.step(false));
+        assert_eq!(at.load(Ordering::Acquire), 2);
+        assert!(queue.idle());
     }
 
     /// Compute submitted before the graphics it waits for, in two parts

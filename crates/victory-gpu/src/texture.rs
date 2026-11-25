@@ -81,9 +81,10 @@ unsafe impl Sync for Staging {}
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        // Retire the upload buffer and its texpool slot so an in-flight GPU
-        // submission or async copy cannot fault on freed staging memory.
-        crate::host::retire((self.buffer.clone(), self._slot.take()));
+        // Closed lists, Early and InFlight hold Arc<Staging> for every
+        // upload. Once the last Arc is gone, only a verified completion
+        // fence is required, not the descriptor retirement frame delay.
+        crate::host::retire_upload((self.buffer.clone(), self._slot.take()));
     }
 }
 

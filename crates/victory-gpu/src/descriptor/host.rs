@@ -185,6 +185,8 @@ struct Bindless {
     checked: (u64, u64, u64),
     /// What submissions do for the slots, until they or what they view change.
     plan: Option<Arc<BindlessPlan>>,
+    /// Shared by this heap's successive plans, never across different heaps.
+    refresh_epoch: Arc<AtomicU64>,
     /// Placed-texture slots as last prepared at recording: view key,
     /// texture.
     recorded: HashMap<u32, (u64, usize)>,
@@ -381,6 +383,7 @@ pub(crate) struct BindlessPlan {
     fresh_reads: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
     /// The frame (plus one) the bounces were last copied in.
     copied_in: AtomicU64,
+    refresh_epoch: Arc<AtomicU64>,
     /// The host resources the slots view, held while a submission runs.
     _retained: Arc<Vec<ID3D12Resource>>,
 }
@@ -399,10 +402,10 @@ impl BindlessPlan {
     /// And whether it is all of it (and may be looked at less often where it
     /// does not change) rather than what is new.
     pub(crate) fn copy_constants(&self) -> (&[(Arc<crate::shadow::Shadow>, usize, usize)], bool) {
-        let frame = crate::queue::presented() + 1;
-        // Counted for all plans: each is the one before with a few changes.
-        static FRAME: AtomicU64 = AtomicU64::new(0);
-        let all = FRAME.swap(frame, Ordering::AcqRel) != frame;
+        let frame = crate::queue::resource_epoch() + 1;
+        // Counted across plans of this heap only. Each distinct heap must
+        // refresh its own buffers, even when another was already copied.
+        let all = self.refresh_epoch.swap(frame, Ordering::AcqRel) != frame;
         let fresh = self.copied_in.swap(frame, Ordering::AcqRel) == 0;
         let (bounces, reads) = match (all || cfg!(test), fresh) {
             (true, _) => (&*self.bounces, &*self.reads),
@@ -1379,7 +1382,7 @@ impl HostHeap {
             return;
         }
         let epoch = crate::resource::placed_epoch();
-        let frame = crate::queue::presented();
+        let frame = crate::queue::resource_epoch();
         // Most draws find nothing to do: a few atomics, no lock.
         let evictions = self.record_looked[0].load(Ordering::Acquire) != epoch
             && self.record_looked[1].load(Ordering::Acquire) != frame + 1;
@@ -1621,7 +1624,7 @@ impl HostHeap {
         );
         // Asked before taking the heap's lock: the placed textures' lock is
         // taken first where both are held.
-        let frame = crate::queue::presented() + 1;
+        let frame = crate::queue::resource_epoch() + 1;
         let evictions = {
             let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             b.checked.1 != epochs.1 && b.looked[0] != frame
@@ -1821,6 +1824,7 @@ impl HostHeap {
                 fresh,
                 fresh_reads,
                 copied_in: AtomicU64::new(0),
+                refresh_epoch: b.refresh_epoch.clone(),
                 _retained: plan._retained.clone(),
             });
             b.plan = Some(plan.clone());
@@ -1845,6 +1849,7 @@ impl HostHeap {
             fresh,
             fresh_reads,
             copied_in: AtomicU64::new(0),
+            refresh_epoch: b.refresh_epoch.clone(),
             _retained: Arc::new(retained),
         });
         b.plan = Some(plan.clone());

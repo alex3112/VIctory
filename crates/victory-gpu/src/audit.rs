@@ -25,14 +25,15 @@ pub fn start(data_dir: &Path) -> io::Result<()> {
     }
     let path = data_dir.join("performance_audit.log");
     let mut file = File::create(&path)?;
-    writeln!(file, "VIctory performance audit v2 | pid={} | diagnostics={}",
+    writeln!(file, "VIctory performance audit v3 | pid={} | diagnostics={}",
         std::process::id(), cfg!(feature = "diagnostics"))?;
     writeln!(file, "CPU timings can overlap; GPU submit+wait is wall time, not GPU execution.")?;
     for key in ["VICTORY_ASYNC_SUBMIT", "VICTORY_GPU_TIMING", "VICTORY_D3D12_DRED",
         "VICTORY_D3D12_DEBUG", "VICTORY_D3D12_GBV", "VICTORY_D3D12_WARP",
         "VICTORY_TEXTURE_MAX", "VICTORY_TEXTURES", "VICTORY_CARD_BUFFERS",
         "VICTORY_HOIST_CLAMPS", "VICTORY_SHADER_LOOP_LIMIT", "VICTORY_FPS",
-        "VICTORY_SWEEP_TILES", "VICTORY_KEEP_RETIRED", "VICTORY_STAGING_BUDGET_MB"] {
+        "VICTORY_SWEEP_TILES", "VICTORY_KEEP_RETIRED", "VICTORY_STAGING_BUDGET_MB",
+        "VICTORY_QUEUE_WORKER", "VICTORY_FORCE_WAITS"] {
         writeln!(file, "{key}={}", std::env::var(key).unwrap_or_else(|_| "<default>".into()))?;
     }
     file.flush()?;
@@ -49,9 +50,10 @@ pub fn start(data_dir: &Path) -> io::Result<()> {
             // stop memory reporting too.
             let now = Instant::now();
             if now >= next {
-                let line = format!("[+{:.3}s] memory_sample presented={} {} {} {}",
+                let line = format!("[+{:.3}s] memory_sample presented={} {} {} {} {}",
                     started.elapsed().as_secs_f64(), crate::queue::presented(),
-                    process_memory(), system_memory(), crate::memstat::atomic_report());
+                    process_memory(), system_memory(), crate::memstat::atomic_report(),
+                    crate::timeline::audit_state());
                 if writeln!(file, "{line}").and_then(|()| file.flush()).is_err() {
                     tracing::warn!("performance audit memory write failed");
                     break;
